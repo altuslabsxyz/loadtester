@@ -67,10 +67,10 @@ func Evaluate(in Input) Verdicts {
 	switch {
 	case in.LogScan.Available && in.LogScan.LaneQuotaRejects > 0:
 		v.Goal1 = VerdictFail // validators rejected a quota-violating block
-	case in.LogScan.Available && in.LogScan.LaneQuotaSkips > 0 && in.ParamsVerified:
-		v.Goal1 = VerdictPass // proposer enforced a lane cap (ground truth), params verified
+	case in.LogScan.Available && in.LogScan.LaneQuotaSkips > 0 && in.ParamsVerified && in.LanesReconciled:
+		v.Goal1 = VerdictPass // enforcement proven; params verified + declared lanes reconciled
 	case in.LogScan.Available && in.LogScan.LaneQuotaSkips > 0:
-		v.Goal1 = VerdictReview // enforcement seen but lane params only assumed (no gRPC)
+		v.Goal1 = VerdictReview // enforcement seen but params assumed (no gRPC) or lanes not reconciled
 	case in.MaxBlockGas == 0:
 		v.Goal1 = VerdictNotEvaluated // quotas undefined
 	default:
@@ -115,15 +115,15 @@ func Evaluate(in Input) Verdicts {
 // REVIEW; PASS wins over the non-committal states; if everything is
 // non-committal (NOT_EVALUATED / INCONCLUSIVE / LIVE) the overall is INCONCLUSIVE.
 func combine(vs ...Verdict) Verdict {
-	anyFail, anyReview, anyPass := false, false, false
+	anyFail, anyReview, anyUnproven := false, false, false
 	for _, v := range vs {
 		switch v {
 		case VerdictFail:
 			anyFail = true
 		case VerdictReview:
 			anyReview = true
-		case VerdictPass:
-			anyPass = true
+		case VerdictInconclusive, VerdictNotEvaluated, VerdictLive:
+			anyUnproven = true // a goal that was not actually proven
 		}
 	}
 	switch {
@@ -131,10 +131,12 @@ func combine(vs ...Verdict) Verdict {
 		return VerdictFail
 	case anyReview:
 		return VerdictReview
-	case anyPass:
-		return VerdictPass
-	default:
+	case anyUnproven:
+		// At least one goal was left unproven (inconclusive / not evaluated /
+		// live). Don't advertise an overall PASS that masks an unproven goal.
 		return VerdictInconclusive
+	default:
+		return VerdictPass // every goal PASS
 	}
 }
 
@@ -169,7 +171,10 @@ func Markdown(in Input) string {
 	if !in.ParamsVerified {
 		fmt.Fprintf(&b, "_Note: lane params were ASSUMED from config (cosmos gRPC unavailable), not read from "+
 			"on-chain state. Attribution below classifies against the config-declared lanes; confirm they match "+
-			"the lanes actually registered on-chain._\n\n")
+			"the lanes actually registered on-chain. (Goal 1 is capped at REVIEW.)_\n\n")
+	} else if !in.LanesReconciled {
+		fmt.Fprintf(&b, "**WARNING**: config-declared lanes do NOT all match the on-chain params (see startup log). "+
+			"Goal 1 for the missing lanes is meaningless; fix the target YAML. (Goal 1 is capped at REVIEW.)\n\n")
 	}
 
 	// Guard: if block.max_gas is unknown/unlimited, every per-lane quota is 0 and
@@ -183,9 +188,13 @@ func Markdown(in Input) string {
 	// (PrepareProposal skip) from the problem path (ProcessProposal reject).
 	if in.LogScan.Available {
 		if in.LogScan.LaneQuotaSkips > 0 {
-			fmt.Fprintf(&b, "**ENFORCED (ground truth)**: %d \"skip tx: lane gas quota exceeded\" log(s) - "+
-				"the proposer actively capped a lane and skipped/overflowed excess txs. Direct proof of enforcement.\n\n",
-				in.LogScan.LaneQuotaSkips)
+			tag := "ENFORCED (ground truth)"
+			if !in.ParamsVerified || !in.LanesReconciled {
+				tag = "ENFORCEMENT SEEN (REVIEW - params assumed or lanes unreconciled)"
+			}
+			fmt.Fprintf(&b, "**%s**: %d \"skip tx: lane gas quota exceeded\" log(s) - "+
+				"the proposer actively capped a lane and skipped/overflowed excess txs.\n\n",
+				tag, in.LogScan.LaneQuotaSkips)
 			for _, s := range in.LogScan.LaneQuotaSamples {
 				fmt.Fprintf(&b, "    %s\n", s)
 			}
@@ -206,6 +215,11 @@ func Markdown(in Input) string {
 		fmt.Fprintf(&b, "**UNPROVABLE (no logs)**: no node logs configured (logPaths) - on this target Goal 1 "+
 			"cannot be proven; the RPC attribution below is only an upper bound, not enforcement evidence.\n\n")
 	}
+	if len(in.LogScan.StaleSkipped) > 0 {
+		fmt.Fprintf(&b, "_Note: %d configured log file(s) were SKIPPED as stale (not written during this run): %v. "+
+			"If you expected ground-truth signals from them, point logPaths at the file this run actually writes._\n\n",
+			len(in.LogScan.StaleSkipped), in.LogScan.StaleSkipped)
+	}
 
 	fmt.Fprintf(&b, "RPC attribution (per-lane sum of tx gas LIMIT by primary lane) vs quota. "+
 		"NOTE: this is an UPPER BOUND - overflow moves excess txs to lower lanes, so a lane reading above quota here "+
@@ -218,10 +232,17 @@ func Markdown(in Input) string {
 		}
 		fmt.Fprintf(&b, "\n")
 	}
-	fmt.Fprintf(&b, "Peak attributed gas per lane vs quota:\n\n")
-	fmt.Fprintf(&b, "| lane | peak gasLimit sum | quota |\n|---|---|---|\n")
-	for _, id := range sortedLaneIDs(in.Lane.PeakLaneGas) {
-		fmt.Fprintf(&b, "| %s (%d) | %d | %d |\n", in.Lane.LaneNames[id], id, in.Lane.PeakLaneGas[id], in.Lane.Quota[id])
+	fmt.Fprintf(&b, "Peak attributed gas per lane vs quota (ALL registered lanes; a lane with no "+
+		"traffic is NOT EXERCISED - the workload generator only produces value/erc20/swap/vip/unordered "+
+		"shapes, so a lane no generated tx matches is never load-tested):\n\n")
+	fmt.Fprintf(&b, "| lane | peak gasLimit sum | quota | status |\n|---|---|---|---|\n")
+	for _, id := range sortedLaneIDs(laneKeys(in.Lane.LaneNames)) {
+		peak := in.Lane.PeakLaneGas[id]
+		status := "exercised"
+		if peak == 0 {
+			status = "**NOT EXERCISED**"
+		}
+		fmt.Fprintf(&b, "| %s (%d) | %d | %d | %s |\n", in.Lane.LaneNames[id], id, peak, in.Lane.Quota[id], status)
 	}
 	fmt.Fprintf(&b, "\n")
 
@@ -336,11 +357,9 @@ func Markdown(in Input) string {
 		fmt.Fprintf(&b, "**Verdict: FAIL** - non-determinism / halt evidence found (see above).\n\n")
 	case len(in.AppHash.StallNotes) > 0:
 		fmt.Fprintf(&b, "**Verdict: REVIEW** - height stall(s) observed; confirm benign (slow blocks) not a halt.\n\n")
-	case !in.AppHash.CompareAvailable && !in.LogScan.Available:
-		fmt.Fprintf(&b, "**Verdict: INCONCLUSIVE** - single node and no logs; no determinism signal available.\n\n")
 	case !in.AppHash.CompareAvailable:
-		fmt.Fprintf(&b, "**Verdict: NO HALT (weak)** - single node; logs show no app-hash panic, but with one node "+
-			"there is no cross-node check. Not a determinism proof.\n\n")
+		fmt.Fprintf(&b, "**Verdict: INCONCLUSIVE** - single node, so there is no cross-node app-hash check. "+
+			"Even with clean logs this is not a determinism signal; use >=2 nodes to evaluate Goal 3.\n\n")
 	default:
 		fmt.Fprintf(&b, "**Verdict: NO HALT OBSERVED** - chain stayed live and %d nodes stayed consistent across %d heights "+
 			"under the determinism workload. This is absence-of-evidence (no halt/mismatch), NOT a determinism proof - "+
@@ -367,6 +386,17 @@ func unorderedSent(sent []workload.KindCount) int {
 		}
 	}
 	return 0
+}
+
+// laneKeys returns the lane-id set (as a map sortedLaneIDs can sort) from the
+// names map, so the report can list EVERY registered lane, not only those that
+// received attributed traffic.
+func laneKeys(m map[int32]string) map[int32]uint64 {
+	out := make(map[int32]uint64, len(m))
+	for k := range m {
+		out[k] = 0
+	}
+	return out
 }
 
 func sortedLaneIDs(m map[int32]uint64) []int32 {
@@ -408,7 +438,7 @@ func reasons(in Input) map[string]string {
 	g1 := map[Verdict]string{
 		VerdictFail:         "ProcessProposal rejected a quota-violating block",
 		VerdictPass:         "proposer skip-logs prove lane-quota enforcement",
-		VerdictReview:       "enforcement seen but lane params only assumed (no gRPC)",
+		VerdictReview:       "enforcement seen but lane params assumed (no gRPC) or declared lanes not reconciled",
 		VerdictNotEvaluated: "block.max_gas unknown - per-lane quotas undefined",
 		VerdictInconclusive: "no proposer logs; RPC attribution is an upper bound only",
 	}[v.Goal1]

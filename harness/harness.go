@@ -111,10 +111,26 @@ func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string)
 	log.Printf("[lanes] effective params: %d vip, %d tx-type lanes, weight=%d%%",
 		len(effParams.VipLanes), len(effParams.TxTypeLanes), effParams.MaxBlockspaceGasWeight)
 
-	// VIP nonce-key bit must match the lane id actually registered ON-CHAIN, not
-	// whatever the YAML declared - else VIP txs land in the wrong/normal lane.
+	// VIP nonce-key bit must match a lane id actually registered ON-CHAIN. Prefer
+	// the declared/preset VIP id if it exists on-chain; otherwise fall back to the
+	// first on-chain VIP lane (with a warning). The tool can only drive ONE VIP
+	// lane, so note when several exist.
 	if len(effParams.VipLanes) > 0 {
-		builder.SetVIPLane(effParams.VipLanes[0].Id)
+		want := plan.ExpectedLane[workload.KindVIP]
+		chosen, found := effParams.VipLanes[0].Id, false
+		for _, vl := range effParams.VipLanes {
+			if vl.Id == want {
+				chosen, found = want, true
+				break
+			}
+		}
+		if !found {
+			log.Printf("[lanes] WARNING: declared VIP lane id %d not on-chain; using on-chain VIP lane %d", want, chosen)
+		}
+		if len(effParams.VipLanes) > 1 {
+			log.Printf("[lanes] NOTE: %d VIP lanes on-chain; only lane %d will receive VIP traffic", len(effParams.VipLanes), chosen)
+		}
+		builder.SetVIPLane(chosen)
 	}
 	// Reconcile config-declared lanes against on-chain params (only meaningful
 	// when params are verified, i.e. gRPC available). Surfaces a config that
@@ -301,8 +317,8 @@ func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string)
 				// ~30s it's a small backlog the proposer isn't pulling (TxProvider),
 				// not draining further - no point burning the full cap.
 				if n == prev {
-					if flat++; flat >= 10 && n > 0 {
-						log.Printf("[drain] CList flat at %d for ~30s - residual tail, stopping", n)
+					if flat++; flat >= 20 && n > 0 {
+						log.Printf("[drain] CList flat at %d for ~60s - residual tail, stopping", n)
 						break
 					}
 				} else {

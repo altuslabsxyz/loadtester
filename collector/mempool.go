@@ -52,10 +52,19 @@ func (r MempoolResult) TailTolerance() int {
 // - a non-zero final depth being worked off, not a wedged backlog.
 func (r MempoolResult) StillDraining() bool {
 	n := len(r.Samples)
-	if n < 6 || !r.CListQueryOK {
+	if n < 2 || !r.CListQueryOK {
 		return false
 	}
-	return r.Samples[n-1].CListNTxs < r.Samples[n-6].CListNTxs
+	last := r.Samples[n-1]
+	// Compare against the most recent sample at least 10s earlier, so the trend
+	// spans at least one block interval (a ~1s window would flip on intra-block
+	// noise and mask a real wedge as "still draining").
+	for i := n - 2; i >= 0; i-- {
+		if last.T.Sub(r.Samples[i].T) >= 10*time.Second {
+			return last.CListNTxs < r.Samples[i].CListNTxs
+		}
+	}
+	return false
 }
 
 // MempoolCollector polls CometBFT CList depth over time.

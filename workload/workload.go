@@ -309,7 +309,10 @@ type Driver struct {
 // NewDriver creates a driver. It seeds the cached fees immediately. vipClient
 // may be nil (no role:vip node configured) - VIP txs are then not sent.
 func NewDriver(ctx context.Context, pool *accounts.Pool, builder *Builder, sink *Sink, vipClient *ethclient.Client) (*Driver, error) {
-	d := &Driver{pool: pool, builder: builder, sink: sink, vipClient: vipClient, recvTTL: 15 * time.Second}
+	// recvTTL is generous: blocks can legitimately take tens of seconds (funding
+	// allows 60s, setup 90s), and a too-short TTL would trip every worker into a
+	// nonce resync at once exactly when the chain is slow.
+	d := &Driver{pool: pool, builder: builder, sink: sink, vipClient: vipClient, recvTTL: 60 * time.Second}
 	if err := d.refreshFees(ctx); err != nil {
 		return nil, err
 	}
@@ -422,26 +425,27 @@ func (d *Driver) Run(ctx context.Context, duration time.Duration, specs []Spec) 
 		}(a)
 	}
 
-	// Unordered (2D-nonce, Nonce=0) senders: fire-and-forget across all accounts.
-	// RATE-LIMITED to ~unorderedInflight tx/sec via a shared ticker so the flood
-	// does not starve the ordered lanes (unordered txs bypass nonce ordering and
-	// are accepted immediately, so without a cap they dominate every block).
+	// Unordered (2D-nonce, Nonce=0) senders: fire-and-forget across all accounts,
+	// RATE-LIMITED to ~unorderedInflight tx/sec so the flood does not starve the
+	// ordered lanes (unordered txs bypass nonce ordering and are accepted
+	// immediately, so uncapped they dominate every block). Each worker self-paces
+	// at interval = nWorkers/rate; enough workers run concurrently to absorb send
+	// latency so the aggregate rate is actually achieved (a single shared ticker
+	// would cap throughput at ~workers/send-latency and silently drop ticks).
 	if unorderedInflight > 0 {
-		interval := time.Second / time.Duration(unorderedInflight)
-		if interval <= 0 {
-			interval = time.Millisecond
-		}
-		tick := time.NewTicker(interval)
-		go func() { <-runCtx.Done(); tick.Stop() }()
 		nWorkers := unorderedInflight
-		if nWorkers > 8 {
-			nWorkers = 8
+		if nWorkers > 32 {
+			nWorkers = 32
+		}
+		perWorker := time.Duration(nWorkers) * time.Second / time.Duration(unorderedInflight)
+		if perWorker <= 0 {
+			perWorker = time.Millisecond
 		}
 		for i := 0; i < nWorkers; i++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				d.unorderedWorker(runCtx, tick.C)
+				d.unorderedWorker(runCtx, perWorker)
 			}()
 		}
 	}
@@ -452,13 +456,15 @@ func (d *Driver) Run(ctx context.Context, duration time.Duration, specs []Spec) 
 // unorderedWorker fire-and-forgets unordered txs (NonceKey=MaxUint64, Nonce=0)
 // from rotating accounts, paced by the shared tick channel (rate limit). Each tx
 // is independent and deduped by its unique timeout, so there is no gap/wedge risk.
-func (d *Driver) unorderedWorker(ctx context.Context, tick <-chan time.Time) {
+func (d *Driver) unorderedWorker(ctx context.Context, interval time.Duration) {
 	accs := d.pool.Accs
+	t := time.NewTicker(interval)
+	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-tick:
+		case <-t.C:
 		}
 		a := accs[int(d.acctRR.Add(1))%len(accs)]
 		tx, err := d.builder.build(KindUnordered, a, 0, d.feeCap.Load(), d.tip.Load())
@@ -501,9 +507,9 @@ func (d *Driver) stdWorker(ctx context.Context, a *accounts.Account, weighted []
 			continue
 		}
 		if err := d.pool.Client.SendTransaction(ctx, tx); err != nil {
-			// Do NOT commit (nonce reused next iteration). Resync from chain in
-			// case the local nonce drifted, then retry.
-			if n, e := d.pool.Client.NonceAt(ctx, a.Addr, nil); e == nil {
+			// Do NOT commit (nonce reused next iteration). Resync from the PENDING
+			// nonce (includes in-flight) so we don't re-send a still-pending tx.
+			if n, e := d.pool.Client.PendingNonceAt(ctx, a.Addr); e == nil {
 				a.SetBase(0, n)
 			}
 			if sleep(ctx, 150*time.Millisecond) {
@@ -517,9 +523,10 @@ func (d *Driver) stdWorker(ctx context.Context, a *accounts.Account, weighted []
 		})
 		if d.waitReceipt(ctx, d.pool.Client, tx.Hash()) {
 			a.Commit(0)
-		} else if n, e := d.pool.Client.NonceAt(ctx, a.Addr, nil); e == nil {
-			// Not mined within recvTTL: resync to the true next nonce (the tx was
-			// dropped, or is slow) rather than reusing a stale local value.
+		} else if n, e := d.pool.Client.PendingNonceAt(ctx, a.Addr); e == nil {
+			// Not mined within recvTTL: resync to the PENDING nonce. If the tx is
+			// still pending this advances PAST it (no double-send); if it was
+			// dropped, pending==latest and the slot is correctly reused.
 			a.SetBase(0, n)
 		}
 	}

@@ -36,6 +36,11 @@ type LogScanResult struct {
 	// Truncated is set if a log line exceeded the scan buffer (scan may be
 	// incomplete - do not treat "no issues found" as authoritative).
 	Truncated bool
+
+	// StaleSkipped lists configured log paths skipped because they were not
+	// written during this run (mtime < run start). An operator who configured
+	// logPaths but sees them here knows their evidence was intentionally ignored.
+	StaleSkipped []string
 }
 
 // scan patterns. Verified against the chain/cometbft source (exact strings).
@@ -73,7 +78,10 @@ func (lc *LogScanCollector) Scan() LogScanResult {
 	for _, p := range lc.paths {
 		// Skip files not written during this run (stale prior-run logs would
 		// otherwise yield false ground-truth signals).
-		if info, serr := os.Stat(p); serr != nil || (!lc.since.IsZero() && info.ModTime().Before(lc.since)) {
+		if info, serr := os.Stat(p); serr != nil {
+			continue
+		} else if !lc.since.IsZero() && info.ModTime().Before(lc.since) {
+			res.StaleSkipped = append(res.StaleSkipped, p)
 			continue
 		}
 		f, err := os.Open(p)
