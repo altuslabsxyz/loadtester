@@ -13,13 +13,20 @@ cosmosChainId: ""            # informational, e.g. stable_2201-1
 # List every reachable node. jsonrpc is required. cometRPC/grpc are OPTIONAL:
 # on a JSON-RPC-only public testnet leave them empty and the harness degrades
 # (mempool via txpool_status, halt via eth_blockNumber, lane params assumed).
+#
+# role: fullnode  -> general load is sent here (PrimaryJSONRPC prefers it)
+# role: validator -> reporting / app-hash comparison
+# role: vip       -> the ONLY endpoint VIP (2D-nonce) txs are sent to. If NO
+#                    role:vip node is listed, the `vip` workload is SKIPPED.
 nodes:
   - name: node-a
-    role: fullnode             # fullnode | validator | vip  (load is sent to a fullnode)
+    role: fullnode             # fullnode | validator | vip
     jsonrpc: https://rpc-a.example/evm
     cometRPC: ""               # e.g. https://rpc-a.example:26657 (mempool CList + app-hash compare)
     grpc: ""                   # e.g. rpc-a.example:9090 (x/stable params: lane verification)
   # - { name: node-b, role: validator, jsonrpc: https://rpc-b.example/evm }
+  # Add a vip node to enable the `vip` workload (VIP txs go only here):
+  # - { name: node-vip, role: vip, jsonrpc: https://rpc-vip.example/evm }
 
 # ── Funding ──────────────────────────────────────────────────────────────
 funding:
@@ -60,7 +67,7 @@ workload:
     # for the standard kinds. Drop a key or set targetInflight: 0 to disable it.
     # value/vip/unordered need NO deployed/mintable token - safe on a bare RPC.
     value:         { targetInflight: 20 }   # native transfer
-    vip:           { targetInflight: 20 }   # 2D-nonce VIP tx
+    vip:           { targetInflight: 20 }   # 2D-nonce VIP tx (needs a role:vip node; else skipped)
     unordered:     { targetInflight: 20 }   # 2D-nonce unordered/timeout tx (STAB-185)
     # erc20Transfer / swap need a self-mintable TestERC20 (+ uniswap pool/callee)
     # from the TS deployer; enable only after deploying and pointing deployment.json.

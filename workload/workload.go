@@ -3,6 +3,7 @@ package workload
 import (
 	"context"
 	"fmt"
+	"log"
 	"math"
 	"math/big"
 	"sort"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/ethclient"
 
 	"github.com/stablelabs/loadtester/accounts"
 	"github.com/stablelabs/loadtester/deployment"
@@ -291,15 +293,21 @@ type Driver struct {
 	builder *Builder
 	sink    *Sink
 
+	// vipClient is the dedicated endpoint VIP (2D-nonce) txs are sent to. VIP txs
+	// are only accepted by the role:vip node, so when this is nil the VIP
+	// workload is skipped entirely.
+	vipClient *ethclient.Client
+
 	feeCap  atomic.Pointer[big.Int]
 	tip     atomic.Pointer[big.Int]
 	recvTTL time.Duration
 	acctRR  atomic.Uint64 // round-robin account selector for unordered senders
 }
 
-// NewDriver creates a driver. It seeds the cached fees immediately.
-func NewDriver(ctx context.Context, pool *accounts.Pool, builder *Builder, sink *Sink) (*Driver, error) {
-	d := &Driver{pool: pool, builder: builder, sink: sink, recvTTL: 15 * time.Second}
+// NewDriver creates a driver. It seeds the cached fees immediately. vipClient
+// may be nil (no role:vip node configured) - VIP txs are then not sent.
+func NewDriver(ctx context.Context, pool *accounts.Pool, builder *Builder, sink *Sink, vipClient *ethclient.Client) (*Driver, error) {
+	d := &Driver{pool: pool, builder: builder, sink: sink, vipClient: vipClient, recvTTL: 15 * time.Second}
 	if err := d.refreshFees(ctx); err != nil {
 		return nil, err
 	}
@@ -336,6 +344,11 @@ func (d *Driver) Run(ctx context.Context, duration time.Duration, specs []Spec) 
 			continue
 		}
 		if s.Kind == KindVIP {
+			// VIP txs require the dedicated role:vip endpoint. Without it, skip.
+			if d.vipClient == nil {
+				log.Printf("[load] VIP workload requested but no VIP RPC (role:vip node) configured - skipping VIP txs")
+				continue
+			}
 			vipEnabled = true
 			continue
 		}
@@ -551,7 +564,8 @@ func (d *Driver) vipWorker(ctx context.Context, a *accounts.Account) {
 			}
 			continue
 		}
-		if err := d.pool.Client.SendTransaction(ctx, tx); err != nil {
+		// VIP txs go ONLY to the dedicated role:vip endpoint.
+		if err := d.vipClient.SendTransaction(ctx, tx); err != nil {
 			if sleep(ctx, 200*time.Millisecond) {
 				return
 			}
@@ -561,21 +575,21 @@ func (d *Driver) vipWorker(ctx context.Context, a *accounts.Account) {
 			Hash: tx.Hash(), From: a.Addr, Kind: KindVIP,
 			ExpectedLane: d.builder.expectedLane[KindVIP], Gas: tx.Gas(), SendTime: time.Now(),
 		})
-		if d.waitReceipt(ctx, tx.Hash()) {
+		if d.waitReceipt(ctx, d.vipClient, tx.Hash()) {
 			a.Commit(vipKey) // mined -> advance; else retry the same nonce
 		}
 	}
 }
 
-// waitReceipt polls until the tx is mined (returns true) or recvTTL elapses /
-// ctx ends (returns false).
-func (d *Driver) waitReceipt(ctx context.Context, hash common.Hash) bool {
+// waitReceipt polls client until the tx is mined (returns true) or recvTTL
+// elapses / ctx ends (returns false).
+func (d *Driver) waitReceipt(ctx context.Context, client *ethclient.Client, hash common.Hash) bool {
 	deadline := time.Now().Add(d.recvTTL)
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			return false
 		}
-		r, err := d.pool.Client.TransactionReceipt(ctx, hash)
+		r, err := client.TransactionReceipt(ctx, hash)
 		if err == nil && r != nil {
 			return true
 		}

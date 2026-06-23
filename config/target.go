@@ -218,6 +218,19 @@ func (t *Target) PrimaryJSONRPC() string {
 	return t.Nodes[0].JSONRPC
 }
 
+// VIPJSONRPC returns the JSON-RPC endpoint VIP txs must be sent to: the first
+// node with role "vip". VIP (2D-nonce) txs are only accepted by that node, so
+// when no vip-role node is configured this returns "" and the harness skips the
+// VIP workload entirely.
+func (t *Target) VIPJSONRPC() string {
+	for _, n := range t.Nodes {
+		if n.Role == RoleVIP && strings.TrimSpace(n.JSONRPC) != "" {
+			return n.JSONRPC
+		}
+	}
+	return ""
+}
+
 // CometRPCs returns all configured CometBFT RPC endpoints (for app-hash compare).
 func (t *Target) CometRPCs() []Node {
 	out := make([]Node, 0, len(t.Nodes))

@@ -6,7 +6,8 @@
 #   loadtester start -t other.yaml
 
 BINARY      := loadtester
-TARGET_FILE := target.yaml
+CONFIG_DIR  := $(HOME)/.loadtester
+TARGET_FILE := $(CONFIG_DIR)/target.yaml
 TEMPLATE    := target.example.yaml
 
 .DEFAULT_GOAL := help
@@ -24,7 +25,8 @@ install: ## Install loadtester onto PATH (go install -> $GOBIN / $GOPATH/bin)
 	go install .
 	@echo "installed $(BINARY) to $$(go env GOBIN 2>/dev/null || echo $$(go env GOPATH)/bin)"
 
-config: ## Scaffold an editable target.yaml from the template (keeps an existing one)
+config: ## Scaffold ~/.loadtester/target.yaml from the template (keeps an existing one)
+	@mkdir -p $(CONFIG_DIR)
 	@if [ -f $(TARGET_FILE) ]; then \
 		echo "$(TARGET_FILE) already exists; leaving it untouched."; \
 	else \

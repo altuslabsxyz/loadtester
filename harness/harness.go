@@ -10,6 +10,7 @@ import (
 	"time"
 
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/ethclient"
 
 	sdk "github.com/cosmos/cosmos-sdk/types"
 
@@ -186,7 +187,20 @@ func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string)
 	}
 
 	// --- load: drive workloads ---
-	driver, err := workload.NewDriver(ctx, pool, builder, &poolSink)
+	// VIP (2D-nonce) txs are only accepted by the role:vip node, so they go to a
+	// dedicated client. Without a role:vip node the VIP workload is skipped.
+	var vipClient *ethclient.Client
+	if vrpc := tgt.VIPJSONRPC(); vrpc != "" {
+		c, _, verr := accounts.Connect(ctx, vrpc, tgt.ChainID)
+		if verr != nil {
+			return fmt.Errorf("vip rpc %s: %w", vrpc, verr)
+		}
+		vipClient = c
+		log.Printf("[load] VIP endpoint: %s", vrpc)
+	} else {
+		log.Printf("[load] no VIP RPC (role:vip node) configured - VIP txs will be skipped")
+	}
+	driver, err := workload.NewDriver(ctx, pool, builder, &poolSink, vipClient)
 	if err != nil {
 		return fmt.Errorf("driver: %w", err)
 	}

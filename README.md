@@ -8,6 +8,7 @@ chain release. Lives beside the `stable` repo (depends on it via a local
 make install              # build + install `loadtester` onto PATH (go install)
 make config               # scaffold an editable target.yaml from target.example.yaml
 $EDITOR target.yaml       # set your endpoints, master key, workload mix
+loadtester config         # print the resolved settings to verify them
 loadtester start          # reads target.yaml by default
 loadtester start --help
 
@@ -17,8 +18,17 @@ loadtester start -t target.testnet.yaml -d deployment.json -o out --fail-on fail
 ```
 
 `make config` copies `target.example.yaml` (a fully commented template of every
-settable value) to `target.yaml` (git-ignored) and never overwrites an existing
-one. `loadtester start` defaults to `--target target.yaml`.
+settable value) to `~/.loadtester/target.yaml` (created if missing, never
+overwritten). `loadtester config` then prints the resolved settings (defaults
+applied, validated; private keys masked, their addresses shown) so you can
+confirm what `start` will use. Both `start` and `config` default to
+`--target ~/.loadtester/target.yaml`; pass `-t` to use a file elsewhere.
+
+> `make config` scaffolds the file; `loadtester config` inspects it.
+
+**VIP txs** are only accepted by a dedicated endpoint, so they are sent to the
+node with `role: vip`. List one to enable the `vip` workload; if no `role: vip`
+node is configured, VIP txs are skipped (logged at start, shown by `config`).
 
 Verifies three things under load:
 
