@@ -1,41 +1,28 @@
 # Testnet target template. Fill in real endpoints/keys.
-# chainId is the testnet build's EVM chain id (NOT necessarily 999).
 name: testnet
-chainId: 2201            # set to the testnet build's EVMChainID
+chainId: 2201            # the testnet's EVM chain id
 cosmosChainId: ""        # e.g. stable_2201-1
 
 nodes:
   # List every reachable node. With >=2 nodes the app-hash collector can
   # cross-compare; with 1 it only detects stall/halt.
-  - { name: node-a, role: fullnode,  jsonrpc: https://rpc-a.example/evm, cometRPC: https://rpc-a.example:26657, grpc: rpc-a.example:9090 }
-  - { name: node-b, role: validator, jsonrpc: https://rpc-b.example/evm, cometRPC: https://rpc-b.example:26657, grpc: rpc-b.example:9090 }
+  - { name: node-a, role: fullnode,  jsonrpc: https://rpc-a.example/evm, cometRPC: https://rpc-a.example:26657 }
+  - { name: node-b, role: validator, jsonrpc: https://rpc-b.example/evm, cometRPC: https://rpc-b.example:26657 }
 
 funding:
-  masterKey: "0x..."     # operator-provided funded key
+  masterKey: "0x..."      # operator-provided funded key
   accountsN: 20
   fundPerAccount: "1"
 
-governance:
-  # On a real testnet use real-vote (needs quorum) or preconfigured (operator
-  # already set the lanes; harness only verifies + classifies).
-  mode: preconfigured
-  proposerKey: ""        # required for real-vote
-  voterKeys: []          # required for real-vote (must cover quorum)
-  deposit: "50000000000000000000000astable"
-  votingNode: 0
-
 workload:
   durationSec: 0          # 0 = CONTINUOUS: load runs until Ctrl+C (no drain/exit)
-  allowDestructive: false # testnet-safe: no SELFDESTRUCT / heavy contention by default
+  allowDestructive: false # testnet-safe: no bump / selfdestruct by default
   lanes:
+    value:         { targetInflight: 20 }
     erc20Transfer: { targetInflight: 40 }
     swap:          { targetInflight: 20 }
-    vip:           { targetInflight: 20 }
-    value:         { targetInflight: 20 }
-    unordered:     { targetInflight: 20 } # 2D-nonce unordered/timeout txs
 
 observe:
   pollIntervalMs: 1000
   drainWindowSec: 90
-  stuckAfterBlocks: 30
-  reportIntervalSec: 60   # continuous mode: write a fresh report snapshot every N s
+  reportIntervalSec: 60   # continuous-mode snapshot cadence

@@ -1,13 +1,11 @@
 // Package accounts manages the fan-out account pool: key generation, funding
-// from a master key, per-(account,nonce-key) nonce tracking, and tx signing for
-// both standard EVM txs and stable-geth 2D-nonce (VIP) txs.
+// from a master key, per-account nonce tracking, and standard EVM tx signing.
 package accounts
 
 import (
 	"context"
 	"crypto/ecdsa"
 	"fmt"
-	"math"
 	"math/big"
 	"strings"
 	"sync"
@@ -17,12 +15,9 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
-	"github.com/holiman/uint256"
-
-	stabletypes "github.com/stablelabs/stable/x/stable/types"
 )
 
-// Account is one signing identity with local 2D-nonce tracking.
+// Account is one signing identity with local nonce tracking.
 type Account struct {
 	Key  *ecdsa.PrivateKey
 	Addr common.Address
@@ -268,60 +263,6 @@ func (p *Pool) SignStandard(a *Account, nonce uint64, to *common.Address, value 
 		To:        to,
 		Value:     value,
 		Data:      data,
-	})
-	return types.SignTx(tx, p.Signer, a.Key)
-}
-
-// SignVIP builds and signs a stable-geth 2D-nonce (CustomTx) tx whose nonce key
-// carries the VIP bit for the given lane id, routing it to that VIP lane.
-func (p *Pool) SignVIP(a *Account, nonce uint64, laneID int32, to *common.Address, value *big.Int, data []byte, gas uint64, feeCap, tip *big.Int) (*types.Transaction, error) {
-	if value == nil {
-		value = big.NewInt(0)
-	}
-	nonceKey := stabletypes.VipFlag | uint64(laneID) // VIP bit set, lane id in lower 63 bits
-	chainID, _ := uint256.FromBig(p.ChainID)
-	val, _ := uint256.FromBig(value)
-	feeCapU, _ := uint256.FromBig(feeCap)
-	tipU, _ := uint256.FromBig(tip)
-	tx := types.NewTx(&types.CustomTx{
-		ChainID:          chainID,
-		Nonce:            nonce,
-		GasTipCap:        tipU,
-		GasFeeCap:        feeCapU,
-		Gas:              gas,
-		To:               to,
-		Value:            val,
-		Data:             data,
-		NonceKey:         nonceKey,
-		TimeoutTimestamp: uint256.NewInt(0), // ordered (not an unordered/timeout tx)
-	})
-	return types.SignTx(tx, p.Signer, a.Key)
-}
-
-// SignUnordered builds and signs a stable-geth unordered (2D-nonce) tx:
-// NonceKey = MaxUint64 (the unordered marker), Nonce MUST be 0, and
-// TimeoutTimestamp is a Unix-NANOSECOND deadline. The chain dedupes unordered
-// txs by (sender, timeout), so callers must pass a UNIQUE future timeout within
-// the chain's max TTL (~10m). Exercises the selective-recheck eviction path.
-func (p *Pool) SignUnordered(a *Account, to *common.Address, value *big.Int, data []byte, gas uint64, feeCap, tip *big.Int, timeoutUnixNano int64) (*types.Transaction, error) {
-	if value == nil {
-		value = big.NewInt(0)
-	}
-	chainID, _ := uint256.FromBig(p.ChainID)
-	val, _ := uint256.FromBig(value)
-	feeCapU, _ := uint256.FromBig(feeCap)
-	tipU, _ := uint256.FromBig(tip)
-	tx := types.NewTx(&types.CustomTx{
-		ChainID:          chainID,
-		Nonce:            0, // required to be 0 for unordered txs
-		GasTipCap:        tipU,
-		GasFeeCap:        feeCapU,
-		Gas:              gas,
-		To:               to,
-		Value:            val,
-		Data:             data,
-		NonceKey:         math.MaxUint64,
-		TimeoutTimestamp: new(uint256.Int).SetUint64(uint64(timeoutUnixNano)),
 	})
 	return types.SignTx(tx, p.Signer, a.Key)
 }

@@ -19,9 +19,10 @@ var (
 var startCmd = &cobra.Command{
 	Use:   "start",
 	Short: "Run the load test against the target chain",
-	Long: "start funds accounts, registers lanes (per the target's governance mode),\n" +
-		"drives the workload mix, and writes a report. With workload.durationSec <= 0\n" +
-		"it runs continuously until Ctrl+C, writing periodic report snapshots.",
+	Long: "start funds accounts, drives the workload mix against the target EVM chain,\n" +
+		"and writes a report (mempool drain + node app-hash consistency). With\n" +
+		"workload.durationSec <= 0 it runs continuously until Ctrl+C, writing periodic\n" +
+		"report snapshots.",
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		defer stop()
