@@ -101,6 +101,42 @@ blockspace:
 - Lane registration is idempotent: a config whose lane ids are already on-chain
   is reused; a changed id set is re-registered (governance modes).
 
+## Running against a public testnet (JSON-RPC only)
+
+A real testnet typically exposes only EVM JSON-RPC - no node log files, often no
+CometBFT RPC, no gRPC, and no validator keys. The harness degrades to that:
+
+1. Copy `target.testnet.yaml`, fill in `chainId`, node `jsonrpc` endpoints, and a
+   funded `masterKey`. Leave `cometRPC`/`grpc` empty if unreachable.
+2. Keep `governance.mode: preconfigured`. Without gRPC the lane params can't be
+   read on-chain, so the harness assumes the config-declared lanes and the report
+   flags Goal 1 as **assumed, not verified**.
+3. Default workloads are token-free (`value`, `vip`, `unordered`) so it runs
+   against a bare endpoint. To enable `erc20Transfer`/`swap`, first deploy the
+   harness `TestERC20`/pool via the TS deployer and point `deployment.json` at it
+   (otherwise the mint reverts and setup aborts with a clear error).
+4. `loader start -t target.testnet.yaml` (continuous by default). For CI, run a
+   one-shot (`durationSec > 0`) with `--fail-on=fail` (or `review`).
+
+What is observable on a JSON-RPC-only target:
+
+- **Goal 1** (lane quota): block gas limit is read via `eth_getBlockByNumber`
+  (JSON-RPC fallback for CometBFT `block.max_gas`); enforcement itself is
+  UNPROVABLE without node logs - attribution is an upper bound only.
+- **Goal 2** (mempool drain): observed via EVM `txpool_status`. If neither
+  `txpool_status` nor CometRPC is available, Goal 2 is **NOT EVALUATED** (never a
+  false PASS).
+- **Goal 3** (determinism): liveness/halt is tracked via `eth_blockNumber`;
+  cross-node app-hash comparison needs CometRPC and is otherwise unavailable
+  (verdict INCONCLUSIVE on a healthy chain, REVIEW on a halt).
+
+### CI gating
+
+`report.json` includes a `verdicts` block (`goal1`/`goal2`/`goal3`/`overall`,
+each PASS/FAIL/REVIEW/INCONCLUSIVE/NOT_EVALUATED/LIVE). `--fail-on=fail|review`
+makes `loader start` exit non-zero when the overall verdict meets the threshold
+(one-shot only; continuous runs are LIVE and never trip it).
+
 ### One-shot vs continuous
 
 - **One-shot** (`workload.durationSec > 0`): load for that long, then adaptive

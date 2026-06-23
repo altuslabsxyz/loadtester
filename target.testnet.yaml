@@ -28,11 +28,17 @@ workload:
   durationSec: 0          # 0 = CONTINUOUS: load runs until Ctrl+C (no drain/exit)
   allowDestructive: false # testnet-safe: no SELFDESTRUCT / heavy contention by default
   lanes:
-    erc20Transfer: { targetInflight: 40 }
-    swap:          { targetInflight: 20 }
-    vip:           { targetInflight: 20 }
-    value:         { targetInflight: 20 }
-    unordered:     { targetInflight: 20 } # 2D-nonce unordered/timeout txs
+    # Default to workloads that need NO deployed/mintable token, so this config
+    # runs end-to-end against a bare JSON-RPC testnet with just a funded master.
+    value:         { targetInflight: 20 } # native transfer
+    vip:           { targetInflight: 20 } # 2D-nonce VIP
+    unordered:     { targetInflight: 20 } # 2D-nonce unordered/timeout txs (STAB-185)
+    # erc20Transfer / swap require a self-mintable TestERC20 (+ uniswap pool/callee).
+    # Enable ONLY after deploying the harness contracts to this testnet via the TS
+    # deployer and pointing deployment.json at them - otherwise PrepareAccounts'
+    # mint reverts and setup aborts.
+    # erc20Transfer: { targetInflight: 40 }
+    # swap:          { targetInflight: 20 }
 
 observe:
   pollIntervalMs: 1000

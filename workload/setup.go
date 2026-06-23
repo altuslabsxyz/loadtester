@@ -129,6 +129,16 @@ func (b *Builder) PrepareAccounts(ctx context.Context) error {
 		}
 		r, err := b.pool.Client.TransactionReceipt(ctx, lastHash)
 		if err == nil && r != nil {
+			// A mint/approve tx is accepted into the mempool even when it will
+			// revert on execution (e.g. the configured token is not self-mintable
+			// on a real testnet). Checking the receipt STATUS prevents silently
+			// proceeding with zero token balance - which would make every
+			// erc20Transfer/swap send revert during the load phase.
+			if r.Status != 1 {
+				return fmt.Errorf("token setup tx %s reverted (status 0): the configured token is likely not "+
+					"self-mintable on this chain - disable the erc20Transfer/swap workloads, or point deployment.json "+
+					"at a mintable TestERC20", lastHash.Hex())
+			}
 			return nil
 		}
 		if sleep(ctx, 300*time.Millisecond) {

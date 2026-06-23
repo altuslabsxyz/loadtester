@@ -87,6 +87,15 @@ func New(ctx context.Context, node config.Node, chainID uint64, cdc codec.Codec)
 // the effective on-chain params the collector should classify against.
 func (r *Registrar) Register(ctx context.Context, mode config.GovMode, plan *laneplan.Plan, gov config.Governance) (*stabletypes.Params, error) {
 	if mode == config.GovPreconfigured {
+		if r.grpc == "" {
+			// JSON-RPC-only testnet: the x/stable params can only be read over
+			// cosmos gRPC, which is not reachable here. In preconfigured mode the
+			// operator asserts the lanes are already registered on-chain, so fall
+			// back to the config/preset-declared plan as the assumed effective
+			// params. The report flags these as assumed-not-verified.
+			p := plan.Params()
+			return &p, nil
+		}
 		return QueryParams(ctx, r.grpc)
 	}
 

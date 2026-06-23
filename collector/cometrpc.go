@@ -8,7 +8,15 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 )
+
+// cometHTTP is a dedicated client with a finite timeout. http.DefaultClient has
+// NO timeout: against a remote/flaky CometBFT RPC behind a load balancer, a
+// connection that is accepted but never answered would block the calling
+// goroutine until the root context is cancelled (i.e. until Ctrl+C). A bounded
+// per-request timeout keeps collectors and the drain loop live on a testnet.
+var cometHTTP = &http.Client{Timeout: 10 * time.Second}
 
 // cometResult unwraps a CometBFT JSON-RPC 2.0 response.
 type cometResult struct {
@@ -33,9 +41,13 @@ func cometGet(ctx context.Context, base, path string, query map[string]string, o
 	if err != nil {
 		return err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := cometHTTP.Do(req)
 	if err != nil {
 		return err
+	}
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+		resp.Body.Close()
+		return fmt.Errorf("comet rpc %s: HTTP %d", path, resp.StatusCode)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)

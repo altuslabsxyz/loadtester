@@ -11,6 +11,20 @@ import (
 	stabletypes "github.com/stablelabs/stable/x/stable/types"
 )
 
+// BlockGasLimit reads the latest block's gas limit over EVM JSON-RPC. It is the
+// JSON-RPC-only fallback for the per-lane quota denominator when CometBFT RPC
+// (consensus_params block.max_gas) is unreachable on a public testnet. On this
+// chain the EVM block gas limit tracks the CometBFT block.max_gas, so it is a
+// sound basis for the quota math; treat it as a best-effort fallback, not an
+// exact read of the consensus parameter.
+func BlockGasLimit(ctx context.Context, client *ethclient.Client) (uint64, error) {
+	head, err := client.HeaderByNumber(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	return head.GasLimit, nil
+}
+
 // LaneViolation is a block where a lane's attributed gas exceeded its quota.
 type LaneViolation struct {
 	Height   uint64

@@ -21,6 +21,10 @@ type Input struct {
 	GovMode     string
 	MaxBlockGas uint64 // chain consensus block.max_gas (0 = unknown/unlimited)
 	Continuous  bool   // true = continuous-mode snapshot (load still running, no drain phase)
+	// ParamsVerified is true when the lane params were read from the chain
+	// (cosmos gRPC). False means they were ASSUMED from config (a JSON-RPC-only
+	// preconfigured target) and were NOT verified against on-chain state.
+	ParamsVerified bool
 
 	Lane      collector.LaneResult
 	Mempool   collector.MempoolResult
@@ -30,17 +34,133 @@ type Input struct {
 	Sent      []workload.KindCount
 }
 
+// Verdict is a machine-readable per-goal / overall outcome.
+type Verdict string
+
+const (
+	VerdictPass         Verdict = "PASS"
+	VerdictFail         Verdict = "FAIL"
+	VerdictReview       Verdict = "REVIEW"
+	VerdictInconclusive Verdict = "INCONCLUSIVE"
+	VerdictNotEvaluated Verdict = "NOT_EVALUATED"
+	VerdictLive         Verdict = "LIVE" // continuous mode: not a pass/fail outcome
+)
+
+// Verdicts is the structured outcome for CI consumption. It mirrors the prose
+// verdicts rendered in Markdown(); both are derived from the same conditions.
+type Verdicts struct {
+	Goal1   Verdict `json:"goal1"`
+	Goal2   Verdict `json:"goal2"`
+	Goal3   Verdict `json:"goal3"`
+	Overall Verdict `json:"overall"`
+}
+
+// Evaluate computes the machine-readable verdicts from the collectors' results.
+func Evaluate(in Input) Verdicts {
+	var v Verdicts
+
+	// Goal 1 - lane quota.
+	switch {
+	case in.LogScan.Available && in.LogScan.LaneQuotaRejects > 0:
+		v.Goal1 = VerdictFail // validators rejected a quota-violating block
+	case in.LogScan.Available && in.LogScan.LaneQuotaSkips > 0:
+		v.Goal1 = VerdictPass // proposer actively enforced a lane cap (ground truth)
+	case in.MaxBlockGas == 0:
+		v.Goal1 = VerdictNotEvaluated // quotas undefined
+	default:
+		v.Goal1 = VerdictInconclusive // RPC attribution is only an upper bound
+	}
+
+	// Goal 2 - mempool drain.
+	switch {
+	case in.Continuous:
+		v.Goal2 = VerdictLive
+	case !in.Mempool.CListQueryOK && !in.Mempool.EVMQueryOK:
+		v.Goal2 = VerdictNotEvaluated
+	case in.Mempool.Drained():
+		v.Goal2 = VerdictPass
+	case in.Mempool.StillDraining():
+		v.Goal2 = VerdictReview // incomplete but trending down, not wedged
+	default:
+		v.Goal2 = VerdictFail
+	}
+
+	// Goal 3 - non-determinism / halt.
+	switch {
+	case len(in.AppHash.Mismatches) > 0 || (in.LogScan.Available && len(in.LogScan.AppHashIssues) > 0):
+		v.Goal3 = VerdictFail
+	case len(in.AppHash.StallNotes) > 0:
+		v.Goal3 = VerdictReview
+	case !in.AppHash.CompareAvailable && !in.LogScan.Available:
+		v.Goal3 = VerdictInconclusive
+	default:
+		v.Goal3 = VerdictPass // no halt observed (absence of evidence, not proof)
+	}
+
+	v.Overall = combine(v.Goal1, v.Goal2, v.Goal3)
+	return v
+}
+
+// combine reduces per-goal verdicts to an overall one. FAIL dominates, then
+// REVIEW; PASS wins over the non-committal states; if everything is
+// non-committal (NOT_EVALUATED / INCONCLUSIVE / LIVE) the overall is INCONCLUSIVE.
+func combine(vs ...Verdict) Verdict {
+	anyFail, anyReview, anyPass := false, false, false
+	for _, v := range vs {
+		switch v {
+		case VerdictFail:
+			anyFail = true
+		case VerdictReview:
+			anyReview = true
+		case VerdictPass:
+			anyPass = true
+		}
+	}
+	switch {
+	case anyFail:
+		return VerdictFail
+	case anyReview:
+		return VerdictReview
+	case anyPass:
+		return VerdictPass
+	default:
+		return VerdictInconclusive
+	}
+}
+
+// Fails reports whether these verdicts trip the given --fail-on threshold.
+// threshold: "none" (never), "fail" (overall FAIL), "review" (overall FAIL or REVIEW).
+func (v Verdicts) Fails(threshold string) bool {
+	switch strings.ToLower(strings.TrimSpace(threshold)) {
+	case "fail":
+		return v.Overall == VerdictFail
+	case "review":
+		return v.Overall == VerdictFail || v.Overall == VerdictReview
+	default:
+		return false
+	}
+}
+
 // Markdown renders the human-readable report.
 func Markdown(in Input) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Load-Tester QA Report\n\n")
 	fmt.Fprintf(&b, "- Target: `%s` (chainId %d)\n", in.TargetName, in.ChainID)
 	fmt.Fprintf(&b, "- Governance mode: `%s`\n", in.GovMode)
-	fmt.Fprintf(&b, "- Sent txs: %d\n\n", in.SentTotal)
+	fmt.Fprintf(&b, "- Sent txs: %d\n", in.SentTotal)
+	ev := Evaluate(in)
+	fmt.Fprintf(&b, "- Verdicts: overall **%s** (goal1=%s, goal2=%s, goal3=%s)\n\n",
+		ev.Overall, ev.Goal1, ev.Goal2, ev.Goal3)
 
 	// Goal 1: Lane quota enforcement.
 	fmt.Fprintf(&b, "## Goal 1 - Guaranteed Blockspace (lane quota)\n\n")
 	fmt.Fprintf(&b, "Blocks observed: %d\n\n", in.Lane.BlocksObserved)
+
+	if !in.ParamsVerified {
+		fmt.Fprintf(&b, "_Note: lane params were ASSUMED from config (cosmos gRPC unavailable), not read from "+
+			"on-chain state. Attribution below classifies against the config-declared lanes; confirm they match "+
+			"the lanes actually registered on-chain._\n\n")
+	}
 
 	// Guard: if block.max_gas is unknown/unlimited, every per-lane quota is 0 and
 	// the violation check is meaningless. Do not render a false pass.
@@ -102,7 +222,11 @@ func Markdown(in Input) string {
 	if !in.Mempool.EVMQueryOK {
 		evmStr = "n/a (txpool_status unavailable)"
 	}
-	fmt.Fprintf(&b, "Final CList: %d, Final EVM: %s\n\n", in.Mempool.FinalCList, evmStr)
+	clistStr := fmt.Sprintf("%d", in.Mempool.FinalCList)
+	if !in.Mempool.CListQueryOK {
+		clistStr = "n/a (no CometRPC)"
+	}
+	fmt.Fprintf(&b, "Final CList: %s, Final EVM: %s\n\n", clistStr, evmStr)
 	switch {
 	case in.Continuous:
 		// Load is still running (or just stopped) with no drain phase, so a full
@@ -110,25 +234,43 @@ func Markdown(in Input) string {
 		fmt.Fprintf(&b, "**LIVE (continuous)**: CList=%d (peak %d). Drain PASS/FAIL is not evaluated while load runs - "+
 			"a non-empty mempool under sustained load is expected. To verify drain, run a one-shot (positive durationSec) "+
 			"or stop the load and watch CList return to 0.\n\n", in.Mempool.FinalCList, in.Mempool.PeakCList)
+	case !in.Mempool.CListQueryOK && !in.Mempool.EVMQueryOK:
+		// Neither CometBFT CList nor EVM txpool_status was ever readable - we have
+		// no mempool signal at all, so drain cannot be evaluated (NOT a PASS).
+		fmt.Fprintf(&b, "**NOT EVALUATED**: no mempool signal available (no CometRPC and txpool_status unsupported), "+
+			"so drain could not be observed. Expose CometRPC or an endpoint serving txpool_status to evaluate Goal 2.\n\n")
 	case in.Mempool.Drained():
-		fmt.Fprintf(&b, "**PASS (liveness)**: the mempool drained to 0 - no txs left stuck.\n\n")
+		fmt.Fprintf(&b, "**PASS (liveness)**: the mempool drained to 0 (CList=%s, EVM=%s) - no txs left stuck.\n\n",
+			clistStr, evmStr)
 	case in.Mempool.StillDraining():
-		fmt.Fprintf(&b, "**INCOMPLETE (draining, not stuck)**: CList=%d at the drain cap but still trending DOWN "+
-			"(peak was %d). Txs are being worked off, not wedged - the open-loop flood outran the drain cap. "+
+		fmt.Fprintf(&b, "**INCOMPLETE (draining, not stuck)**: CList=%s, EVM=%s at the drain cap but still trending DOWN "+
+			"(peak CList was %d). Txs are being worked off, not wedged - the open-loop flood outran the drain cap. "+
 			"Raise observe.drainWindowSec or lower workload inflight to confirm it reaches 0.\n\n",
-			in.Mempool.FinalCList, in.Mempool.PeakCList)
+			clistStr, evmStr, in.Mempool.PeakCList)
 	default:
-		fmt.Fprintf(&b, "**FAIL**: mempool flat at CList=%d, EVM=%s and NOT draining - likely stuck/pending txs.\n\n",
-			in.Mempool.FinalCList, evmStr)
+		fmt.Fprintf(&b, "**FAIL**: mempool flat at CList=%s, EVM=%s and NOT draining - likely stuck/pending txs.\n\n",
+			clistStr, evmStr)
 	}
-	fmt.Fprintf(&b, "_Scope caveat: this workload sends ORDERED txs, so a clean drain shows ordinary recheck works. "+
-		"It does NOT isolate selective vs full recheck, and does NOT reproduce the STAB-185 unordered/timeout-tx gap "+
-		"(no unordered txs are sent). To target STAB-185, send unordered txs with short timeouts and confirm they are evicted._\n\n")
+	switch {
+	case unorderedSent(in.Sent) > 0:
+		fmt.Fprintf(&b, "_Scope caveat: %d unordered (2D-nonce, NonceKey=MaxUint64) tx(s) WERE sent, exercising the "+
+			"STAB-185 selective-recheck/timeout-eviction path. Note this harness fires them open-loop and does not yet "+
+			"verify per-tx that timed-out unordered txs were evicted (vs mined or stuck) - a clean overall drain is "+
+			"consistent with, but not direct proof of, correct eviction._\n\n", unorderedSent(in.Sent))
+	case in.Mempool.CListQueryOK || in.Mempool.EVMQueryOK:
+		fmt.Fprintf(&b, "_Scope caveat: this run sent ORDERED txs only, so a clean drain shows ordinary recheck works. "+
+			"It does NOT isolate selective vs full recheck, and does NOT reproduce the STAB-185 unordered/timeout-tx gap "+
+			"(no unordered txs were sent). To target STAB-185, enable the `unordered` workload._\n\n")
+	}
 
 	// Goal 3: Non-determinism.
 	fmt.Fprintf(&b, "## Goal 3 - Non-determinism (app-hash / BlockSTM / MemIAVL)\n\n")
 	fmt.Fprintf(&b, "Nodes: %s\n\n", strings.Join(in.AppHash.NodeNames, ", "))
 	fmt.Fprintf(&b, "Heights checked: %d\n\n", in.AppHash.HeightsChecked)
+	if in.AppHash.EthLiveness {
+		fmt.Fprintf(&b, "_Liveness tracked via EVM eth_blockNumber (no CometRPC configured): a consensus HALT would "+
+			"be flagged below, but cross-node app_hash comparison is not possible on a JSON-RPC-only target._\n\n")
+	}
 	fmt.Fprintf(&b, "_Method note: under CometBFT, a COMMITTED block's app_hash is agreed by consensus - all nodes that "+
 		"committed height H necessarily share it. So cross-node agreement on committed hashes is EXPECTED and is a "+
 		"liveness/consistency check, not by itself proof of determinism. Genuine non-determinism manifests as a "+
@@ -204,6 +346,16 @@ func Markdown(in Input) string {
 	return b.String()
 }
 
+// unorderedSent returns how many unordered (STAB-185) txs were sent.
+func unorderedSent(sent []workload.KindCount) int {
+	for _, s := range sent {
+		if s.Kind == string(workload.KindUnordered) {
+			return s.Count
+		}
+	}
+	return 0
+}
+
 func sortedLaneIDs(m map[int32]uint64) []int32 {
 	ids := make([]int32, 0, len(m))
 	for id := range m {
@@ -225,6 +377,7 @@ type jsonReport struct {
 	LogScan     collector.LogScanResult `json:"logScan"`
 	SentTotal   int                     `json:"sentTotal"`
 	Sent        []workload.KindCount    `json:"sent"`
+	Verdicts    Verdicts                `json:"verdicts"`
 }
 
 // Write writes report.md and report.json into dir, returning the md path.
@@ -247,6 +400,7 @@ func Write(dir string, in Input) (string, error) {
 		LogScan:     in.LogScan,
 		SentTotal:   in.SentTotal,
 		Sent:        in.Sent,
+		Verdicts:    Evaluate(in),
 	}
 	raw, err := json.MarshalIndent(jr, "", "  ")
 	if err != nil {

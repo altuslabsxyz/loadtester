@@ -204,6 +204,23 @@ func (p *Pool) Fund(ctx context.Context, amountWholeTokens string) error {
 		return fmt.Errorf("suggest fees: %w", err)
 	}
 
+	// Master-balance precheck: on a public testnet a faucet-limited master that
+	// can't cover N transfers + gas would otherwise fund an arbitrary prefix of
+	// accounts and then fail mid-stream (or time out waiting), leaving the rest
+	// unfunded. Fail fast with a clear, actionable message instead.
+	n := int64(len(p.Accs))
+	bal, err := p.Client.BalanceAt(ctx, p.Master.Addr, nil)
+	if err != nil {
+		return fmt.Errorf("read master balance: %w", err)
+	}
+	need := new(big.Int).Mul(wei, big.NewInt(n))
+	gasPerTx := new(big.Int).Mul(big.NewInt(21000), feeCap)
+	need.Add(need, new(big.Int).Mul(gasPerTx, big.NewInt(n)))
+	if bal.Cmp(need) < 0 {
+		return fmt.Errorf("master %s balance %s wei < required ~%s wei (%d accounts x %s wei + gas); "+
+			"fund the master or lower funding.accountsN / fundPerAccount", p.Master.Addr.Hex(), bal, need, n, wei)
+	}
+
 	var lastHash common.Hash
 	for _, a := range p.Accs {
 		nonce := p.Master.Next(0)
