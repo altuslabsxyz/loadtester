@@ -37,6 +37,17 @@ func (r MempoolResult) Drained() bool {
 	return r.CListQueryOK && r.FinalCList == 0
 }
 
+// TailTolerance is the residual CList size treated as a small un-drained tail
+// (likely txs the validator's TxProvider never pulled) rather than a wedge:
+// max(16, 0.1% of peak).
+func (r MempoolResult) TailTolerance() int {
+	t := r.PeakCList / 1000
+	if t < 16 {
+		t = 16
+	}
+	return t
+}
+
 // StillDraining reports whether the CList was strictly trending DOWN at the end
 // - a non-zero final depth being worked off, not a wedged backlog.
 func (r MempoolResult) StillDraining() bool {

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"os"
 	"strings"
+	"time"
 )
 
 // LogScanResult is ground-truth scraped from node logs. Unlike post-commit RPC
@@ -53,10 +54,14 @@ var (
 // LogScanCollector scrapes node log files once (at report time).
 type LogScanCollector struct {
 	paths []string
+	since time.Time // ignore files last modified before this (stale prior-run logs)
 }
 
-func NewLogScanCollector(paths []string) *LogScanCollector {
-	return &LogScanCollector{paths: paths}
+// NewLogScanCollector scrapes the given log files. since is the run start: a file
+// not modified during the run cannot hold this run's evidence and is skipped, so
+// a stale file from a previous run can't produce a false ENFORCED / FAIL signal.
+func NewLogScanCollector(paths []string, since time.Time) *LogScanCollector {
+	return &LogScanCollector{paths: paths, since: since}
 }
 
 // Scan reads the configured log files and extracts ground-truth signals.
@@ -66,6 +71,11 @@ func (lc *LogScanCollector) Scan() LogScanResult {
 		return res
 	}
 	for _, p := range lc.paths {
+		// Skip files not written during this run (stale prior-run logs would
+		// otherwise yield false ground-truth signals).
+		if info, serr := os.Stat(p); serr != nil || (!lc.since.IsZero() && info.ModTime().Before(lc.since)) {
+			continue
+		}
 		f, err := os.Open(p)
 		if err != nil {
 			continue

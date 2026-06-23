@@ -188,6 +188,11 @@ var AllKinds = []Kind{
 // the on-chain params).
 func (b *Builder) SetExpectedLane(m map[Kind]int32) { b.expectedLane = m }
 
+// SetVIPLane sets the VIP lane id used for the VIP nonce-key bit. It must match
+// the lane id actually registered ON-CHAIN (not the YAML), or VIP txs land in
+// the wrong/normal lane. Called after the effective params are read from chain.
+func (b *Builder) SetVIPLane(id int32) { b.expectedLane[KindVIP] = id }
+
 // DeriveExpectedLanes computes each supported kind's expected lane by building a
 // representative tx and classifying it with the provided function (the chain's
 // lane matcher over the on-chain params). VIP is skipped: its lane id must be
@@ -278,23 +283,13 @@ type Spec struct {
 	Inflight int
 }
 
-// ahead is the per-account in-flight window (assigned-minus-confirmed nonces).
-//
-// It is 1 on the stable chain: the ante admits only nonce == the account's
-// committed nonce and there is NO future-nonce queue (a gapped nonce is rejected
-// with ErrNonceGap and dropped, not held). So sending nonce N+1 before N commits
-// just wastes the send. Real concurrency therefore comes from the NUMBER of
-// accounts, not depth per account - each account sustains exactly one in-flight
-// tx and advances as the confirmed-nonce poller observes inclusion.
-const ahead = 1
-
-// Driver drives load with one goroutine per account, each sustaining `ahead`
-// (=1) in-flight txs: send the next nonce, then wait for the confirmed-nonce
-// poller to observe inclusion before sending again. Lane oversubscription comes
-// from running MANY accounts concurrently, not from depth per account (the chain
-// rejects future nonces, so per-account depth >1 is impossible). VIP (2D-nonce,
-// key!=0) runs closed-loop (send+wait) on a few reserved accounts; its sequence
-// is seeded/resynced from the on-chain noncekey precompile.
+// Driver drives load with one goroutine per account, each strictly 1-in-flight:
+// send the next nonce, wait for its receipt, then send again. The stable chain
+// rejects future nonces (ErrNonceGap) with no queue, so per-account depth >1 is
+// impossible - lane oversubscription comes from running MANY accounts. VIP
+// (2D-nonce, key!=0) runs the same closed-loop on a few reserved accounts; its
+// sequence is seeded/resynced from the on-chain noncekey precompile. Unordered
+// txs are rate-limited fire-and-forget (they bypass nonce ordering).
 type Driver struct {
 	pool    *accounts.Pool
 	builder *Builder
@@ -404,28 +399,10 @@ func (d *Driver) Run(ctx context.Context, duration time.Duration, specs []Spec) 
 		}
 	}()
 
-	// Confirmed-nonce poller for the standard key so the open-loop window can
-	// advance (without this, Inflight never shrinks and senders stall).
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		t := time.NewTicker(1 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-runCtx.Done():
-				return
-			case <-t.C:
-				for _, a := range stdAccs {
-					if n, err := d.pool.Client.NonceAt(runCtx, a.Addr, nil); err == nil {
-						a.SetConfirmed(0, n)
-					}
-				}
-			}
-		}
-	}()
-
-	// Standard open-loop senders: one goroutine per account.
+	// Standard senders: one goroutine per account, each 1-in-flight closed-loop
+	// (send -> wait for its own receipt -> next). No shared confirmed-nonce poller
+	// is needed; per-send receipt confirmation tracks block speed instead of a
+	// fixed 1s cadence and avoids abandoning a merely-slow tx.
 	if len(weighted) > 0 {
 		for _, a := range stdAccs {
 			wg.Add(1)
@@ -446,18 +423,25 @@ func (d *Driver) Run(ctx context.Context, duration time.Duration, specs []Spec) 
 	}
 
 	// Unordered (2D-nonce, Nonce=0) senders: fire-and-forget across all accounts.
-	// Each tx is independent (unique timeout, no nonce stream), so no per-account
-	// window applies. Worker count is capped to keep send concurrency bounded.
+	// RATE-LIMITED to ~unorderedInflight tx/sec via a shared ticker so the flood
+	// does not starve the ordered lanes (unordered txs bypass nonce ordering and
+	// are accepted immediately, so without a cap they dominate every block).
 	if unorderedInflight > 0 {
+		interval := time.Second / time.Duration(unorderedInflight)
+		if interval <= 0 {
+			interval = time.Millisecond
+		}
+		tick := time.NewTicker(interval)
+		go func() { <-runCtx.Done(); tick.Stop() }()
 		nWorkers := unorderedInflight
-		if nWorkers > 32 {
-			nWorkers = 32
+		if nWorkers > 8 {
+			nWorkers = 8
 		}
 		for i := 0; i < nWorkers; i++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				d.unorderedWorker(runCtx)
+				d.unorderedWorker(runCtx, tick.C)
 			}()
 		}
 	}
@@ -466,26 +450,22 @@ func (d *Driver) Run(ctx context.Context, duration time.Duration, specs []Spec) 
 }
 
 // unorderedWorker fire-and-forgets unordered txs (NonceKey=MaxUint64, Nonce=0)
-// from rotating accounts. No nonce commit / window: each tx is independent and
-// deduped by its unique timeout, so there is no gap/wedge risk.
-func (d *Driver) unorderedWorker(ctx context.Context) {
+// from rotating accounts, paced by the shared tick channel (rate limit). Each tx
+// is independent and deduped by its unique timeout, so there is no gap/wedge risk.
+func (d *Driver) unorderedWorker(ctx context.Context, tick <-chan time.Time) {
 	accs := d.pool.Accs
 	for {
-		if ctx.Err() != nil {
+		select {
+		case <-ctx.Done():
 			return
+		case <-tick:
 		}
 		a := accs[int(d.acctRR.Add(1))%len(accs)]
 		tx, err := d.builder.build(KindUnordered, a, 0, d.feeCap.Load(), d.tip.Load())
 		if err != nil {
-			if sleep(ctx, 200*time.Millisecond) {
-				return
-			}
 			continue
 		}
 		if err := d.pool.Client.SendTransaction(ctx, tx); err != nil {
-			if sleep(ctx, 150*time.Millisecond) {
-				return
-			}
 			continue
 		}
 		d.sink.Add(SentTx{
@@ -495,36 +475,23 @@ func (d *Driver) unorderedWorker(ctx context.Context) {
 	}
 }
 
-// stdWorker submits standard (key-0) txs open-loop from one account, cycling the
-// weighted kind mix, bounded by the `ahead` window.
+// stdWorker submits standard (key-0) txs from one account, cycling the weighted
+// kind mix, strictly 1-in-flight (closed-loop): send the next nonce, wait for
+// its receipt, then send again. The stable chain rejects future nonces (no
+// queue), so depth >1 per account is impossible; concurrency comes from running
+// many accounts. Confirming via the tx's own receipt tracks block speed (vs a
+// fixed-cadence poller) and only re-seeds when a tx truly does not mine, so a
+// merely-slow tx is not abandoned.
 func (d *Driver) stdWorker(ctx context.Context, a *accounts.Account, weighted []Kind) {
-	i := 0
-	cappedSince := time.Time{} // when the account first hit the ahead cap
-	for {
+	// Seed the nonce from chain (prior phases - funding, token setup - advanced it).
+	if n, err := d.pool.Client.PendingNonceAt(ctx, a.Addr); err == nil {
+		a.SetBase(0, n)
+	}
+	for i := 0; ; i++ {
 		if ctx.Err() != nil {
 			return
 		}
-		if a.Inflight(0) >= ahead {
-			// Wedge recovery: if we stay capped for a while, the confirmed nonce
-			// has stopped advancing (a mid-stream tx was dropped, leaving a gap
-			// nothing can fill). Re-seed the local nonce to the chain's actual
-			// next nonce, abandoning the gapped backlog so the account resumes.
-			if cappedSince.IsZero() {
-				cappedSince = time.Now()
-			} else if time.Since(cappedSince) > 10*time.Second {
-				if n, e := d.pool.Client.NonceAt(ctx, a.Addr, nil); e == nil {
-					a.SetBase(0, n)
-				}
-				cappedSince = time.Time{}
-			}
-			if sleep(ctx, 100*time.Millisecond) {
-				return
-			}
-			continue
-		}
-		cappedSince = time.Time{}
 		k := weighted[i%len(weighted)]
-		i++
 		nonce := a.Peek(0)
 		tx, err := d.builder.build(k, a, nonce, d.feeCap.Load(), d.tip.Load())
 		if err != nil {
@@ -534,9 +501,9 @@ func (d *Driver) stdWorker(ctx context.Context, a *accounts.Account, weighted []
 			continue
 		}
 		if err := d.pool.Client.SendTransaction(ctx, tx); err != nil {
-			// Do NOT commit: the nonce is reused next iteration (no burn).
-			// Re-sync from chain in case our local nonce drifted ahead.
-			if n, e := d.pool.Client.NonceAt(ctx, a.Addr, nil); e == nil && n > a.Peek(0) {
+			// Do NOT commit (nonce reused next iteration). Resync from chain in
+			// case the local nonce drifted, then retry.
+			if n, e := d.pool.Client.NonceAt(ctx, a.Addr, nil); e == nil {
 				a.SetBase(0, n)
 			}
 			if sleep(ctx, 150*time.Millisecond) {
@@ -544,11 +511,17 @@ func (d *Driver) stdWorker(ctx context.Context, a *accounts.Account, weighted []
 			}
 			continue
 		}
-		a.Commit(0)
 		d.sink.Add(SentTx{
 			Hash: tx.Hash(), From: a.Addr, Kind: k,
 			ExpectedLane: d.builder.expectedLane[k], Gas: tx.Gas(), SendTime: time.Now(),
 		})
+		if d.waitReceipt(ctx, d.pool.Client, tx.Hash()) {
+			a.Commit(0)
+		} else if n, e := d.pool.Client.NonceAt(ctx, a.Addr, nil); e == nil {
+			// Not mined within recvTTL: resync to the true next nonce (the tx was
+			// dropped, or is slow) rather than reusing a stale local value.
+			a.SetBase(0, n)
+		}
 	}
 }
 

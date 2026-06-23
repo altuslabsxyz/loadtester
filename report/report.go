@@ -25,6 +25,10 @@ type Input struct {
 	// (cosmos gRPC). False means they were ASSUMED from config (a JSON-RPC-only
 	// preconfigured target) and were NOT verified against on-chain state.
 	ParamsVerified bool
+	// LanesReconciled is true when every config-declared lane was found on-chain
+	// (only checkable when ParamsVerified). False means the declared lanes do not
+	// match chain - Goal 1 for the missing lanes is meaningless.
+	LanesReconciled bool
 
 	Lane      collector.LaneResult
 	Mempool   collector.MempoolResult
@@ -63,15 +67,18 @@ func Evaluate(in Input) Verdicts {
 	switch {
 	case in.LogScan.Available && in.LogScan.LaneQuotaRejects > 0:
 		v.Goal1 = VerdictFail // validators rejected a quota-violating block
+	case in.LogScan.Available && in.LogScan.LaneQuotaSkips > 0 && in.ParamsVerified:
+		v.Goal1 = VerdictPass // proposer enforced a lane cap (ground truth), params verified
 	case in.LogScan.Available && in.LogScan.LaneQuotaSkips > 0:
-		v.Goal1 = VerdictPass // proposer actively enforced a lane cap (ground truth)
+		v.Goal1 = VerdictReview // enforcement seen but lane params only assumed (no gRPC)
 	case in.MaxBlockGas == 0:
 		v.Goal1 = VerdictNotEvaluated // quotas undefined
 	default:
 		v.Goal1 = VerdictInconclusive // RPC attribution is only an upper bound
 	}
 
-	// Goal 2 - mempool drain.
+	// Goal 2 - mempool drain. A small residual tail the validator's TxProvider
+	// never pulls is not a wedge - treat it as REVIEW, not FAIL.
 	switch {
 	case in.Continuous:
 		v.Goal2 = VerdictLive
@@ -80,7 +87,9 @@ func Evaluate(in Input) Verdicts {
 	case in.Mempool.Drained():
 		v.Goal2 = VerdictPass
 	case in.Mempool.StillDraining():
-		v.Goal2 = VerdictReview // incomplete but trending down, not wedged
+		v.Goal2 = VerdictReview // trending down, just didn't finish in the cap
+	case in.Mempool.FinalCList <= in.Mempool.TailTolerance():
+		v.Goal2 = VerdictReview // small residual tail, likely un-pulled by TxProvider
 	default:
 		v.Goal2 = VerdictFail
 	}
@@ -91,10 +100,11 @@ func Evaluate(in Input) Verdicts {
 		v.Goal3 = VerdictFail
 	case len(in.AppHash.StallNotes) > 0:
 		v.Goal3 = VerdictReview
-	case !in.AppHash.CompareAvailable && !in.LogScan.Available:
+	case !in.AppHash.CompareAvailable:
+		// Single node: no cross-node check, so "no halt" is weak - never a PASS.
 		v.Goal3 = VerdictInconclusive
 	default:
-		v.Goal3 = VerdictPass // no halt observed (absence of evidence, not proof)
+		v.Goal3 = VerdictPass // multi-node stayed consistent (absence of evidence, not proof)
 	}
 
 	v.Overall = combine(v.Goal1, v.Goal2, v.Goal3)
@@ -242,11 +252,17 @@ func Markdown(in Input) string {
 		fmt.Fprintf(&b, "**PASS (liveness)**: the CList drained to 0 - no txs left stuck.\n\n")
 	case in.Mempool.StillDraining():
 		fmt.Fprintf(&b, "**INCOMPLETE (draining, not stuck)**: CList=%s at the drain cap but still trending DOWN "+
-			"(peak was %d). Txs are being worked off, not wedged - the open-loop flood outran the drain cap. "+
+			"(peak was %d). Txs are being worked off, not wedged - the flood outran the drain cap. "+
 			"Raise observe.drainWindowSec or lower workload inflight to confirm it reaches 0.\n\n",
 			clistStr, in.Mempool.PeakCList)
+	case in.Mempool.FinalCList <= in.Mempool.TailTolerance():
+		fmt.Fprintf(&b, "**REVIEW (residual tail)**: CList settled at %s (<= tail tolerance %d, peak %d). On stable the "+
+			"validator builds blocks by PULLING from fullnodes via TxProvider, so a small tail can linger in a fullnode's "+
+			"CList that the proposer never pulls (rate-limit / height-lag / recheck) - not a wedge. Confirm chain height "+
+			"kept advancing.\n\n", clistStr, in.Mempool.TailTolerance(), in.Mempool.PeakCList)
 	default:
-		fmt.Fprintf(&b, "**FAIL**: CList flat at %s and NOT draining - likely stuck/pending txs.\n\n", clistStr)
+		fmt.Fprintf(&b, "**FAIL**: CList flat at %s (> tail tolerance %d) and NOT draining - likely stuck/pending txs.\n\n",
+			clistStr, in.Mempool.TailTolerance())
 	}
 	switch {
 	case unorderedSent(in.Sent) > 0:
@@ -364,17 +380,52 @@ func sortedLaneIDs(m map[int32]uint64) []int32 {
 
 // jsonReport is the machine-readable form.
 type jsonReport struct {
-	TargetName  string                  `json:"targetName"`
-	ChainID     uint64                  `json:"chainId"`
-	GovMode     string                  `json:"govMode"`
-	MaxBlockGas uint64                  `json:"maxBlockGas"`
-	Lane        collector.LaneResult    `json:"lane"`
-	Mempool     collector.MempoolResult `json:"mempool"`
-	AppHash     collector.AppHashResult `json:"appHash"`
-	LogScan     collector.LogScanResult `json:"logScan"`
-	SentTotal   int                     `json:"sentTotal"`
-	Sent        []workload.KindCount    `json:"sent"`
-	Verdicts    Verdicts                `json:"verdicts"`
+	SchemaVersion   int                     `json:"schemaVersion"`
+	TargetName      string                  `json:"targetName"`
+	ChainID         uint64                  `json:"chainId"`
+	GovMode         string                  `json:"govMode"`
+	MaxBlockGas     uint64                  `json:"maxBlockGas"`
+	Continuous      bool                    `json:"continuous"`
+	ParamsVerified  bool                    `json:"paramsVerified"`
+	LanesReconciled bool                    `json:"lanesReconciled"`
+	Lane            collector.LaneResult    `json:"lane"`
+	Mempool         collector.MempoolResult `json:"mempool"`
+	AppHash         collector.AppHashResult `json:"appHash"`
+	LogScan         collector.LogScanResult `json:"logScan"`
+	SentTotal       int                     `json:"sentTotal"`
+	Sent            []workload.KindCount    `json:"sent"`
+	Verdicts        Verdicts                `json:"verdicts"`
+	Reasons         map[string]string       `json:"reasons"`
+}
+
+// reportSchemaVersion lets a consuming skill detect the report shape.
+const reportSchemaVersion = 1
+
+// reasons returns a short machine-readable "why" per goal, so a consuming skill
+// can explain the verdict from JSON alone without parsing the Markdown.
+func reasons(in Input) map[string]string {
+	v := Evaluate(in)
+	g1 := map[Verdict]string{
+		VerdictFail:         "ProcessProposal rejected a quota-violating block",
+		VerdictPass:         "proposer skip-logs prove lane-quota enforcement",
+		VerdictReview:       "enforcement seen but lane params only assumed (no gRPC)",
+		VerdictNotEvaluated: "block.max_gas unknown - per-lane quotas undefined",
+		VerdictInconclusive: "no proposer logs; RPC attribution is an upper bound only",
+	}[v.Goal1]
+	g2 := map[Verdict]string{
+		VerdictLive:         "continuous mode - drain not evaluated while load runs",
+		VerdictNotEvaluated: "no CometRPC - CList depth unobservable (txpool RPCs vestigial)",
+		VerdictPass:         "CList drained to 0",
+		VerdictReview:       fmt.Sprintf("CList settled at %d (tail/slow), not wedged", in.Mempool.FinalCList),
+		VerdictFail:         fmt.Sprintf("CList flat at %d and not draining", in.Mempool.FinalCList),
+	}[v.Goal2]
+	g3 := map[Verdict]string{
+		VerdictFail:         "app-hash mismatch / halt / panic observed",
+		VerdictReview:       "height stall observed - confirm benign vs halt",
+		VerdictInconclusive: "single node - no cross-node app-hash check possible",
+		VerdictPass:         "multi-node stayed consistent, no halt (absence of evidence)",
+	}[v.Goal3]
+	return map[string]string{"goal1": g1, "goal2": g2, "goal3": g3}
 }
 
 // Write writes report.md and report.json into dir, returning the md path.
@@ -387,17 +438,22 @@ func Write(dir string, in Input) (string, error) {
 		return "", err
 	}
 	jr := jsonReport{
-		TargetName:  in.TargetName,
-		ChainID:     in.ChainID,
-		GovMode:     in.GovMode,
-		MaxBlockGas: in.MaxBlockGas,
-		Lane:        in.Lane,
-		Mempool:     in.Mempool,
-		AppHash:     in.AppHash,
-		LogScan:     in.LogScan,
-		SentTotal:   in.SentTotal,
-		Sent:        in.Sent,
-		Verdicts:    Evaluate(in),
+		SchemaVersion:   reportSchemaVersion,
+		TargetName:      in.TargetName,
+		ChainID:         in.ChainID,
+		GovMode:         in.GovMode,
+		MaxBlockGas:     in.MaxBlockGas,
+		Continuous:      in.Continuous,
+		ParamsVerified:  in.ParamsVerified,
+		LanesReconciled: in.LanesReconciled,
+		Lane:            in.Lane,
+		Mempool:         in.Mempool,
+		AppHash:         in.AppHash,
+		LogScan:         in.LogScan,
+		SentTotal:       in.SentTotal,
+		Sent:            in.Sent,
+		Verdicts:        Evaluate(in),
+		Reasons:         reasons(in),
 	}
 	raw, err := json.MarshalIndent(jr, "", "  ")
 	if err != nil {

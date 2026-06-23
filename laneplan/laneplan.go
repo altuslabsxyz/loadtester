@@ -113,7 +113,14 @@ func (p *Plan) Params() stabletypes.Params {
 func BuildFromConfig(bs config.Blockspace, d *deployment.Deployment) (*Plan, error) {
 	p := &Plan{
 		MaxBlockspaceGasWeight: bs.MaxBlockspaceGasWeight,
-		ExpectedLane:           map[workload.Kind]int32{},
+		// Pre-seed the non-matched kinds to LaneNormal (mirrors Build), so a kind
+		// whose expected lane isn't derived later never defaults to the int32 zero
+		// value (which would mis-attribute every such tx to a bogus "lane 0").
+		ExpectedLane: map[workload.Kind]int32{
+			workload.KindValue:        LaneNormalID,
+			workload.KindBump:         LaneNormalID,
+			workload.KindSelfDestruct: LaneNormalID,
+		},
 	}
 	for _, l := range bs.Lanes {
 		if l.VIP {

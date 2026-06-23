@@ -45,6 +45,7 @@ func initSDKConfig() {
 // verdict; continuous runs (verdict LIVE) never trip it.
 func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string) error {
 	initSDKConfig()
+	runStart := time.Now() // log-scan ignores files older than this (stale prior-run logs)
 
 	tgt, err := config.Load(targetPath)
 	if err != nil {
@@ -110,6 +111,37 @@ func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string)
 	log.Printf("[lanes] effective params: %d vip, %d tx-type lanes, weight=%d%%",
 		len(effParams.VipLanes), len(effParams.TxTypeLanes), effParams.MaxBlockspaceGasWeight)
 
+	// VIP nonce-key bit must match the lane id actually registered ON-CHAIN, not
+	// whatever the YAML declared - else VIP txs land in the wrong/normal lane.
+	if len(effParams.VipLanes) > 0 {
+		builder.SetVIPLane(effParams.VipLanes[0].Id)
+	}
+	// Reconcile config-declared lanes against on-chain params (only meaningful
+	// when params are verified, i.e. gRPC available). Surfaces a config that
+	// declares lanes not actually registered - the operator's stated lanes are
+	// what they expect to verify, so a mismatch must be loud.
+	lanesReconciled := paramsVerified
+	if paramsVerified && len(tgt.Blockspace.Lanes) > 0 {
+		onchain := map[int32]bool{}
+		for _, l := range effParams.VipLanes {
+			onchain[l.Id] = true
+		}
+		for _, l := range effParams.TxTypeLanes {
+			onchain[l.Id] = true
+		}
+		var missing []int32
+		for _, l := range tgt.Blockspace.Lanes {
+			if !onchain[l.ID] {
+				missing = append(missing, l.ID)
+			}
+		}
+		if len(missing) > 0 {
+			lanesReconciled = false
+			log.Printf("[lanes] WARNING: declared lanes NOT found on-chain: %v - "+
+				"Goal 1 for those lanes is meaningless; fix the target YAML", missing)
+		}
+	}
+
 	// --- observe: start collectors ---
 	primaryComet := firstCometRPC(tgt)
 	maxBlockGas := uint64(0)
@@ -160,18 +192,19 @@ func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string)
 	// report builder/writer closures (shared by one-shot and continuous modes).
 	buildInput := func() report.Input {
 		in := report.Input{
-			TargetName:     tgt.Name,
-			ChainID:        tgt.ChainID,
-			GovMode:        string(tgt.Governance.Mode),
-			MaxBlockGas:    maxBlockGas,
-			Continuous:     tgt.Workload.Continuous(),
-			ParamsVerified: paramsVerified,
-			Lane:           laneCol.Result(),
-			AppHash:        appCol.Result(),
-			LogScan:        collector.NewLogScanCollector(tgt.LogPaths).Scan(),
-			SentTotal:      poolSink.Total(),
-			Sent:           poolSink.Stats(),
-			Mempool:        memCol.Result(),
+			TargetName:      tgt.Name,
+			ChainID:         tgt.ChainID,
+			GovMode:         string(tgt.Governance.Mode),
+			MaxBlockGas:     maxBlockGas,
+			Continuous:      tgt.Workload.Continuous(),
+			ParamsVerified:  paramsVerified,
+			LanesReconciled: lanesReconciled,
+			Lane:            laneCol.Result(),
+			AppHash:         appCol.Result(),
+			LogScan:         collector.NewLogScanCollector(tgt.LogPaths, runStart).Scan(),
+			SentTotal:       poolSink.Total(),
+			Sent:            poolSink.Stats(),
+			Mempool:         memCol.Result(),
 		}
 		return in
 	}
@@ -251,7 +284,7 @@ func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string)
 		}
 		log.Printf("[drain] polling mempool until empty (cap %s)", drainCap)
 		deadline := time.Now().Add(drainCap)
-		zeros := 0
+		zeros, prev, flat := 0, -1, 0
 		for time.Now().Before(deadline) {
 			n, derr := collector.NumUnconfirmedTxs(ctx, primaryComet)
 			if derr == nil {
@@ -264,6 +297,18 @@ func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string)
 				} else {
 					zeros = 0
 				}
+				// Stop early on a flat residual tail: if depth hasn't decreased for
+				// ~30s it's a small backlog the proposer isn't pulling (TxProvider),
+				// not draining further - no point burning the full cap.
+				if n == prev {
+					if flat++; flat >= 10 && n > 0 {
+						log.Printf("[drain] CList flat at %d for ~30s - residual tail, stopping", n)
+						break
+					}
+				} else {
+					flat = 0
+				}
+				prev = n
 				log.Printf("[drain] CList=%d", n)
 			}
 			if !sleepCtx(ctx, 3*time.Second) {
