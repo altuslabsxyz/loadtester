@@ -75,7 +75,7 @@ func Evaluate(in Input) Verdicts {
 	switch {
 	case in.Continuous:
 		v.Goal2 = VerdictLive
-	case !in.Mempool.CListQueryOK && !in.Mempool.EVMQueryOK:
+	case !in.Mempool.CListQueryOK:
 		v.Goal2 = VerdictNotEvaluated
 	case in.Mempool.Drained():
 		v.Goal2 = VerdictPass
@@ -216,17 +216,15 @@ func Markdown(in Input) string {
 	fmt.Fprintf(&b, "\n")
 
 	// Goal 2: Mempool drain / selective recheck.
+	// Depth is the CometBFT CList (num_unconfirmed_txs); the EVM txpool RPCs are
+	// vestigial on the stable chain (always 0) and are not used.
 	fmt.Fprintf(&b, "## Goal 2 - Selective-Recheck (mempool drain)\n\n")
-	fmt.Fprintf(&b, "Peak CList: %d, Peak EVM(pending+queued): %d\n\n", in.Mempool.PeakCList, in.Mempool.PeakEVM)
-	evmStr := fmt.Sprintf("%d", in.Mempool.FinalEVM)
-	if !in.Mempool.EVMQueryOK {
-		evmStr = "n/a (txpool_status unavailable)"
-	}
+	fmt.Fprintf(&b, "Peak CList: %d\n\n", in.Mempool.PeakCList)
 	clistStr := fmt.Sprintf("%d", in.Mempool.FinalCList)
 	if !in.Mempool.CListQueryOK {
 		clistStr = "n/a (no CometRPC)"
 	}
-	fmt.Fprintf(&b, "Final CList: %s, Final EVM: %s\n\n", clistStr, evmStr)
+	fmt.Fprintf(&b, "Final CList: %s\n\n", clistStr)
 	switch {
 	case in.Continuous:
 		// Load is still running (or just stopped) with no drain phase, so a full
@@ -234,22 +232,21 @@ func Markdown(in Input) string {
 		fmt.Fprintf(&b, "**LIVE (continuous)**: CList=%d (peak %d). Drain PASS/FAIL is not evaluated while load runs - "+
 			"a non-empty mempool under sustained load is expected. To verify drain, run a one-shot (positive durationSec) "+
 			"or stop the load and watch CList return to 0.\n\n", in.Mempool.FinalCList, in.Mempool.PeakCList)
-	case !in.Mempool.CListQueryOK && !in.Mempool.EVMQueryOK:
-		// Neither CometBFT CList nor EVM txpool_status was ever readable - we have
-		// no mempool signal at all, so drain cannot be evaluated (NOT a PASS).
-		fmt.Fprintf(&b, "**NOT EVALUATED**: no mempool signal available (no CometRPC and txpool_status unsupported), "+
-			"so drain could not be observed. Expose CometRPC or an endpoint serving txpool_status to evaluate Goal 2.\n\n")
+	case !in.Mempool.CListQueryOK:
+		// No CometRPC was reachable - the CList is the only trustworthy mempool
+		// signal on this chain (EVM txpool RPCs are always 0), so drain cannot be
+		// evaluated. NOT a PASS.
+		fmt.Fprintf(&b, "**NOT EVALUATED**: no CometRPC reachable, so CList depth could not be observed "+
+			"(the EVM txpool RPCs are vestigial on this chain). Expose a CometRPC endpoint to evaluate Goal 2.\n\n")
 	case in.Mempool.Drained():
-		fmt.Fprintf(&b, "**PASS (liveness)**: the mempool drained to 0 (CList=%s, EVM=%s) - no txs left stuck.\n\n",
-			clistStr, evmStr)
+		fmt.Fprintf(&b, "**PASS (liveness)**: the CList drained to 0 - no txs left stuck.\n\n")
 	case in.Mempool.StillDraining():
-		fmt.Fprintf(&b, "**INCOMPLETE (draining, not stuck)**: CList=%s, EVM=%s at the drain cap but still trending DOWN "+
-			"(peak CList was %d). Txs are being worked off, not wedged - the open-loop flood outran the drain cap. "+
+		fmt.Fprintf(&b, "**INCOMPLETE (draining, not stuck)**: CList=%s at the drain cap but still trending DOWN "+
+			"(peak was %d). Txs are being worked off, not wedged - the open-loop flood outran the drain cap. "+
 			"Raise observe.drainWindowSec or lower workload inflight to confirm it reaches 0.\n\n",
-			clistStr, evmStr, in.Mempool.PeakCList)
+			clistStr, in.Mempool.PeakCList)
 	default:
-		fmt.Fprintf(&b, "**FAIL**: mempool flat at CList=%s, EVM=%s and NOT draining - likely stuck/pending txs.\n\n",
-			clistStr, evmStr)
+		fmt.Fprintf(&b, "**FAIL**: CList flat at %s and NOT draining - likely stuck/pending txs.\n\n", clistStr)
 	}
 	switch {
 	case unorderedSent(in.Sent) > 0:
@@ -257,7 +254,7 @@ func Markdown(in Input) string {
 			"STAB-185 selective-recheck/timeout-eviction path. Note this harness fires them open-loop and does not yet "+
 			"verify per-tx that timed-out unordered txs were evicted (vs mined or stuck) - a clean overall drain is "+
 			"consistent with, but not direct proof of, correct eviction._\n\n", unorderedSent(in.Sent))
-	case in.Mempool.CListQueryOK || in.Mempool.EVMQueryOK:
+	case in.Mempool.CListQueryOK:
 		fmt.Fprintf(&b, "_Scope caveat: this run sent ORDERED txs only, so a clean drain shows ordinary recheck works. "+
 			"It does NOT isolate selective vs full recheck, and does NOT reproduce the STAB-185 unordered/timeout-tx gap "+
 			"(no unordered txs were sent). To target STAB-185, enable the `unordered` workload._\n\n")

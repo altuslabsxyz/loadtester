@@ -143,9 +143,10 @@ What is observable on a JSON-RPC-only target:
 - **Goal 1** (lane quota): block gas limit is read via `eth_getBlockByNumber`
   (JSON-RPC fallback for CometBFT `block.max_gas`); enforcement itself is
   UNPROVABLE without node logs - attribution is an upper bound only.
-- **Goal 2** (mempool drain): observed via EVM `txpool_status`. If neither
-  `txpool_status` nor CometRPC is available, Goal 2 is **NOT EVALUATED** (never a
-  false PASS).
+- **Goal 2** (mempool drain): observed via CometBFT `num_unconfirmed_txs` (CList
+  depth). The EVM txpool RPCs (`txpool_status`/`content`) are vestigial on the
+  stable chain (always 0) and are not used. Without a reachable CometRPC there is
+  no trustworthy mempool signal, so Goal 2 is **NOT EVALUATED** (never a false PASS).
 - **Goal 3** (determinism): liveness/halt is tracked via `eth_blockNumber`;
   cross-node app-hash comparison needs CometRPC and is otherwise unavailable
   (verdict INCONCLUSIVE on a healthy chain, REVIEW on a halt).

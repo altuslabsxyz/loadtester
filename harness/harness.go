@@ -142,14 +142,11 @@ func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string)
 		builder.DeriveExpectedLanes(classifier.PrimaryLane, pool.Accs[0], feeCap, tip)
 	}
 
-	// The mempool collector observes EVM txpool_status (pure JSON-RPC) plus the
-	// CometBFT CList when a CometRPC is configured. Build it whenever JSON-RPC is
-	// up - including JSON-RPC-only testnets - so Goal 2 is observed (and not a
-	// false PASS) even without CometRPC.
-	memCol, err := collector.NewMempoolCollector(ctx, primaryComet, tgt.PrimaryJSONRPC())
-	if err != nil {
-		return fmt.Errorf("mempool collector: %w", err)
-	}
+	// The mempool collector tracks the CometBFT CList depth (num_unconfirmed_txs).
+	// The EVM txpool RPCs are NOT used: on the stable chain they are vestigial and
+	// always report 0. Without a CometRPC there is no reliable mempool signal, so
+	// Goal 2 is reported NOT EVALUATED (never a false PASS).
+	memCol := collector.NewMempoolCollector(primaryComet)
 	appCol := collector.NewAppHashCollector(cometNodes(tgt), pool.Client)
 
 	obsCtx, stopObs := context.WithCancel(ctx)
@@ -275,47 +272,13 @@ func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string)
 			}
 		}
 	} else {
-		// JSON-RPC-only target: no CometBFT CList. Drain-poll the EVM mempool via
-		// txpool_status instead of a blind timed wait, so Goal 2 is actually
-		// observed. Fall back to a plain sleep only if txpool_status is unsupported.
-		drainCap := time.Duration(tgt.Observe.DrainWindowSec) * time.Second
-		if drainCap < 5*time.Minute {
-			drainCap = 5 * time.Minute
-		}
-		log.Printf("[drain] polling EVM txpool until empty (cap %s)", drainCap)
-		deadline := time.Now().Add(drainCap)
-		zeros, everOK := 0, false
-		for time.Now().Before(deadline) {
-			pollCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			depth, ok := memCol.CurrentEVMDepth(pollCtx)
-			cancel()
-			if ok {
-				everOK = true
-				if depth == 0 {
-					zeros++
-					if zeros >= 2 {
-						log.Printf("[drain] EVM mempool drained to 0")
-						break
-					}
-				} else {
-					zeros = 0
-				}
-				log.Printf("[drain] EVM pending+queued=%d", depth)
-			} else if !everOK {
-				// txpool_status unsupported on this endpoint: stop polling and wait.
-				log.Printf("[drain] txpool_status unavailable; waiting %s for mempool to settle", drainCap)
-				sleepCtx(ctx, time.Duration(tgt.Observe.DrainWindowSec)*time.Second)
-				break
-			} else {
-				// Had signal before, now transiently failing - keep polling to the
-				// cap but surface why progress logs stopped.
-				log.Printf("[drain] txpool_status query failed (transient); retrying")
-			}
-			if !sleepCtx(ctx, 3*time.Second) {
-				log.Printf("[drain] interrupted")
-				break
-			}
-		}
+		// No CometRPC: the CList depth (the only trustworthy mempool signal on the
+		// stable chain) is unobservable here, and the EVM txpool RPCs are vestigial
+		// (always 0). There is nothing reliable to poll, so just wait the drain
+		// window; Goal 2 is reported NOT EVALUATED.
+		drain := time.Duration(tgt.Observe.DrainWindowSec) * time.Second
+		log.Printf("[drain] no CometRPC; mempool drain not observable (waiting %s, Goal 2 = NOT EVALUATED)", drain)
+		sleepCtx(ctx, drain)
 	}
 
 	stopObs()

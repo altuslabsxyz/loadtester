@@ -221,8 +221,11 @@ func (p *Pool) Fund(ctx context.Context, amountWholeTokens string) error {
 			"fund the master or lower funding.accountsN / fundPerAccount", p.Master.Addr.Hex(), bal, need, n, wei)
 	}
 
-	var lastHash common.Hash
-	for _, a := range p.Accs {
+	// Lockstep funding: the master is a single sender, and the chain admits only
+	// nonce == its committed nonce (no future-nonce queue - a gapped nonce is
+	// rejected and dropped). So each funding tx MUST be mined before the next is
+	// sent; blasting them all would get every tx after the first dropped.
+	for i, a := range p.Accs {
 		nonce := p.Master.Next(0)
 		tx := types.NewTx(&types.DynamicFeeTx{
 			ChainID:   p.ChainID,
@@ -238,12 +241,11 @@ func (p *Pool) Fund(ctx context.Context, amountWholeTokens string) error {
 			return fmt.Errorf("sign funding tx: %w", err)
 		}
 		if err := p.Client.SendTransaction(ctx, signed); err != nil {
-			return fmt.Errorf("send funding tx to %s: %w", a.Addr, err)
+			return fmt.Errorf("send funding tx %d/%d to %s: %w", i+1, len(p.Accs), a.Addr, err)
 		}
-		lastHash = signed.Hash()
-	}
-	if err := p.waitMined(ctx, lastHash, 60*time.Second); err != nil {
-		return fmt.Errorf("wait funding mined: %w", err)
+		if err := p.waitMined(ctx, signed.Hash(), 60*time.Second); err != nil {
+			return fmt.Errorf("wait funding tx %d/%d (%s): %w", i+1, len(p.Accs), a.Addr, err)
+		}
 	}
 	for _, a := range p.Accs {
 		if err := p.seedNonce(ctx, a); err != nil {

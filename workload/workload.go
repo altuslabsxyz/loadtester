@@ -278,17 +278,23 @@ type Spec struct {
 	Inflight int
 }
 
-// ahead is the per-account open-loop in-flight window (assigned-minus-confirmed
-// nonces). Matches the chain's AccountQueue scale so accounts stay executable.
-const ahead = 64
+// ahead is the per-account in-flight window (assigned-minus-confirmed nonces).
+//
+// It is 1 on the stable chain: the ante admits only nonce == the account's
+// committed nonce and there is NO future-nonce queue (a gapped nonce is rejected
+// with ErrNonceGap and dropped, not held). So sending nonce N+1 before N commits
+// just wastes the send. Real concurrency therefore comes from the NUMBER of
+// accounts, not depth per account - each account sustains exactly one in-flight
+// tx and advances as the confirmed-nonce poller observes inclusion.
+const ahead = 1
 
-// Driver drives load OPEN-LOOP: each account runs its own goroutine that keeps
-// submitting txs without waiting for receipts, bounded only by the `ahead`
-// window (refreshed from on-chain confirmed nonce). This is what actually
-// oversubscribes lanes - throughput scales with accounts*ahead, not block
-// latency. VIP (2D-nonce, key!=0) runs closed-loop (send+wait) on a few
-// reserved accounts; its sequence is seeded/resynced from the on-chain
-// noncekey precompile (eth_getTransactionCount only reports nonce key 0).
+// Driver drives load with one goroutine per account, each sustaining `ahead`
+// (=1) in-flight txs: send the next nonce, then wait for the confirmed-nonce
+// poller to observe inclusion before sending again. Lane oversubscription comes
+// from running MANY accounts concurrently, not from depth per account (the chain
+// rejects future nonces, so per-account depth >1 is impossible). VIP (2D-nonce,
+// key!=0) runs closed-loop (send+wait) on a few reserved accounts; its sequence
+// is seeded/resynced from the on-chain noncekey precompile.
 type Driver struct {
 	pool    *accounts.Pool
 	builder *Builder
