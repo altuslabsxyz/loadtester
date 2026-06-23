@@ -286,8 +286,9 @@ const ahead = 64
 // submitting txs without waiting for receipts, bounded only by the `ahead`
 // window (refreshed from on-chain confirmed nonce). This is what actually
 // oversubscribes lanes - throughput scales with accounts*ahead, not block
-// latency. VIP (2D-nonce, key!=0) has no standard confirmed-nonce query, so a
-// few accounts run VIP closed-loop (send+wait) instead.
+// latency. VIP (2D-nonce, key!=0) runs closed-loop (send+wait) on a few
+// reserved accounts; its sequence is seeded/resynced from the on-chain
+// noncekey precompile (eth_getTransactionCount only reports nonce key 0).
 type Driver struct {
 	pool    *accounts.Pool
 	builder *Builder
@@ -552,6 +553,15 @@ func (d *Driver) stdWorker(ctx context.Context, a *accounts.Account, weighted []
 // confirmed query.
 func (d *Driver) vipWorker(ctx context.Context, a *accounts.Account) {
 	vipKey := d.builder.NonceKey(KindVIP)
+	// Seed the VIP (2D-nonce) sequence from the on-chain noncekey precompile.
+	// eth_getTransactionCount only reports nonce key 0, so without this the local
+	// counter would wrongly start at 0 for a key the account may have already
+	// used (prior run / preconfigured), and every VIP tx would be rejected.
+	if seq, err := accounts.Nonce2D(ctx, d.vipClient, a.Addr, vipKey); err == nil {
+		a.SetBase(vipKey, seq)
+	} else {
+		log.Printf("[vip] seed nonce via precompile failed for %s (key=%d): %v", a.Addr, vipKey, err)
+	}
 	for {
 		if ctx.Err() != nil {
 			return
@@ -566,6 +576,11 @@ func (d *Driver) vipWorker(ctx context.Context, a *accounts.Account) {
 		}
 		// VIP txs go ONLY to the dedicated role:vip endpoint.
 		if err := d.vipClient.SendTransaction(ctx, tx); err != nil {
+			// Resync the VIP nonce from the precompile in case the local counter
+			// drifted from the on-chain 2D-nonce sequence.
+			if seq, e := accounts.Nonce2D(ctx, d.vipClient, a.Addr, vipKey); e == nil {
+				a.SetBase(vipKey, seq)
+			}
 			if sleep(ctx, 200*time.Millisecond) {
 				return
 			}
