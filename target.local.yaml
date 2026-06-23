@@ -1,0 +1,67 @@
+# Local target: chain brought up by stable repo's init.sh (3 nodes).
+# EVM chainId is build-time injected; a local init build uses 999.
+name: local
+chainId: 999
+# cosmos chain-id is derived from EVM_CHAIN_ID by init.sh (stable_<id>-1).
+cosmosChainId: stable_999-1
+
+# Node log files (local only) scraped for ground-truth signals: lane-quota
+# enforcement and app-hash mismatch/halt. init.sh writes these.
+logPaths:
+  - /tmp/stabled-validator.log
+  - /tmp/stabled-normal.log
+  - /tmp/stabled-vip.log
+
+nodes:
+  # validator first so governance.votingNode 0 targets it.
+  - { name: validator, role: validator, jsonrpc: http://127.0.0.1:8565, cometRPC: http://127.0.0.1:26677, grpc: 127.0.0.1:9110 }
+  - { name: fullnode,  role: fullnode,  jsonrpc: http://127.0.0.1:8545, cometRPC: http://127.0.0.1:26657, grpc: 127.0.0.1:9090 }
+  - { name: vip,       role: vip,       jsonrpc: http://127.0.0.1:8555, cometRPC: http://127.0.0.1:26667, grpc: 127.0.0.1:9100 }
+
+funding:
+  # init.sh KEY (pre-funded).
+  masterKey: "0x3710c8ddb9863035a35a2b92f513b2f93c5ed26a9da6cd33490b76c4601385b0"
+  accountsN: 20
+  fundPerAccount: "1"
+
+governance:
+  mode: fast-pass
+  # node0 = KEY (validator with deposit + voting power).
+  proposerKey: "0x3710c8ddb9863035a35a2b92f513b2f93c5ed26a9da6cd33490b76c4601385b0"
+  voterKeys:
+    - "0x3710c8ddb9863035a35a2b92f513b2f93c5ed26a9da6cd33490b76c4601385b0"
+    - "0x48a4c95e005e8bda9cf112c151e5cc2d764ee5ceeafb44bd76edeca984aafac0"
+    - "0x10866397302ea3454d78ead059a92b04593aa66e6c583f961a22a1a2c4650f26"
+    - "0xe331290b8d2f13e1f0151b22a21f3967460954e399f069d6dd4ae30f8805c24f"
+  # min_deposit is 10000000 astable (init.sh); 1e8 clears it with margin.
+  deposit: "100000000astable"
+  votingNode: 0
+
+# Optional: config-driven lane plan. If present (non-empty lanes), it REPLACES
+# the built-in preset, so you can define/toggle arbitrary lanes without code.
+# Omit this block to use the preset (erc20+swap+vip). Addresses accept "@name"
+# deployment refs; methods are 4-byte hex selectors. Example (commented):
+# blockspace:
+#   maxBlockspaceGasWeight: 50
+#   lanes:
+#     - { id: 1,  name: vip,   weight: 20, vip: true }
+#     - { id: 10, name: erc20, weight: 30, toAddrs: ["@token0"],     methods: ["0xa9059cbb"], txTypes: ["DYNAMIC_FEE"] }
+#     - { id: 20, name: swap,  weight: 20, toAddrs: ["@callee"],      methods: ["0x..."],      txTypes: ["DYNAMIC_FEE"] }
+#     # drop the swap entry above to turn the swap LANE off (swap txs -> normal).
+
+workload:
+  durationSec: 120
+  allowDestructive: true # local only
+  lanes:
+    erc20Transfer: { targetInflight: 100 }
+    swap:          { targetInflight: 50 }
+    vip:           { targetInflight: 50 }
+    value:         { targetInflight: 50 }
+    bump:          { targetInflight: 30 }
+    selfdestruct:  { targetInflight: 20 }
+    unordered:     { targetInflight: 30 } # 2D-nonce unordered/timeout txs (STAB-185 path)
+
+observe:
+  pollIntervalMs: 500
+  drainWindowSec: 60
+  stuckAfterBlocks: 20
