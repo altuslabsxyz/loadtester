@@ -1,0 +1,83 @@
+# loadtester target template. Copy to target.yaml (`make config` does this),
+# then edit the values below. One file fully describes one environment - local
+# init.sh chain or a remote testnet - switching is a config change, not code.
+#
+# Only `chainId` and at least one node `jsonrpc` are strictly required; other
+# fields have the defaults noted in comments.
+
+name: my-env                 # label shown in the report
+chainId: 2201                # EVM eip155 chain id; a mismatch with the node aborts the run
+cosmosChainId: ""            # informational, e.g. stable_2201-1
+
+# ── Nodes ────────────────────────────────────────────────────────────────
+# List every reachable node. jsonrpc is required. cometRPC/grpc are OPTIONAL:
+# on a JSON-RPC-only public testnet leave them empty and the harness degrades
+# (mempool via txpool_status, halt via eth_blockNumber, lane params assumed).
+nodes:
+  - name: node-a
+    role: fullnode             # fullnode | validator | vip  (load is sent to a fullnode)
+    jsonrpc: https://rpc-a.example/evm
+    cometRPC: ""               # e.g. https://rpc-a.example:26657 (mempool CList + app-hash compare)
+    grpc: ""                   # e.g. rpc-a.example:9090 (x/stable params: lane verification)
+  # - { name: node-b, role: validator, jsonrpc: https://rpc-b.example/evm }
+
+# ── Funding ──────────────────────────────────────────────────────────────
+funding:
+  masterKey: "0x..."           # pre-funded key; fans out to the load accounts
+  accountsN: 20                # number of load accounts to generate
+  fundPerAccount: "1"          # whole native tokens per account
+
+# ── Governance (how lanes get registered) ─────────────────────────────────
+governance:
+  # preconfigured: don't register; read current params (needs grpc) or, without
+  #   grpc, ASSUME the lanes declared below (report flags them "not verified").
+  # real-vote: submit a proposal + vote, wait out the real voting period (needs
+  #   proposerKey/voterKeys covering quorum).
+  # fast-pass: submit + vote YES, assume a short voting period (local chains).
+  mode: preconfigured          # default if omitted: preconfigured
+  proposerKey: ""              # required for fast-pass/real-vote
+  voterKeys: []                # required for fast-pass/real-vote (must cover quorum)
+  deposit: "50000000000000000000000astable"
+  votingNode: 0                # node index used to submit/vote
+
+# ── Lane definitions (optional) ───────────────────────────────────────────
+# Omit this whole block to use the built-in preset (erc20 + swap + vip).
+# Addresses accept "0x.." or "@name" deployment refs; methods are 4-byte hex
+# selectors; txTypes: LEGACY|ACCESS_LIST|DYNAMIC_FEE|SET_CODE|TWO_D_NONCE.
+# blockspace:
+#   maxBlockspaceGasWeight: 50         # reserved pool = 50% of block gas
+#   lanes:
+#     - { id: 1,  name: vip,   weight: 20, vip: true }
+#     - { id: 10, name: erc20, weight: 30, toAddrs: ["@token0"], methods: ["0xa9059cbb"], txTypes: ["DYNAMIC_FEE"] }
+#     - { id: 20, name: swap,  weight: 20, toAddrs: ["@callee"],  methods: ["0x128acb08"], txTypes: ["DYNAMIC_FEE"] }
+
+# ── Workload (what to send, how hard) ──────────────────────────────────────
+workload:
+  durationSec: 0               # >0 = one-shot for N seconds; <=0 = CONTINUOUS (until Ctrl+C)
+  allowDestructive: false      # gate bump/selfdestruct (keep false on a testnet)
+  lanes:
+    # Relative targetInflight sets the per-account mix ratio (quantized to /10)
+    # for the standard kinds. Drop a key or set targetInflight: 0 to disable it.
+    # value/vip/unordered need NO deployed/mintable token - safe on a bare RPC.
+    value:         { targetInflight: 20 }   # native transfer
+    vip:           { targetInflight: 20 }   # 2D-nonce VIP tx
+    unordered:     { targetInflight: 20 }   # 2D-nonce unordered/timeout tx (STAB-185)
+    # erc20Transfer / swap need a self-mintable TestERC20 (+ uniswap pool/callee)
+    # from the TS deployer; enable only after deploying and pointing deployment.json.
+    # erc20Transfer: { targetInflight: 40 }
+    # swap:          { targetInflight: 20 }
+    # bump:          { targetInflight: 30 }   # needs allowDestructive: true + Destructible
+    # selfdestruct:  { targetInflight: 20 }   # needs allowDestructive: true + Destructible
+
+# ── Observe / report ───────────────────────────────────────────────────────
+observe:
+  pollIntervalMs: 1000         # collector poll cadence (default 200)
+  drainWindowSec: 90           # one-shot drain wait (default 60)
+  stuckAfterBlocks: 30         # stuck-tx threshold in blocks (default 20)
+  reportIntervalSec: 60        # continuous-mode snapshot cadence (default 30)
+
+# ── Node logs (local init.sh only) ─────────────────────────────────────────
+# Ground-truth signals (lane-quota enforcement, app-hash panic/halt). Leave
+# empty on a testnet where node logs are not reachable.
+# logPaths:
+#   - /tmp/stabled-validator.log

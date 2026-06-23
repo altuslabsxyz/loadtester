@@ -1,4 +1,7 @@
+/loadtester
 /loader
+/bin/
+target.yaml
 out/
 deployment.json
 *.log

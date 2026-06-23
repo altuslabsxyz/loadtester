@@ -31,7 +31,7 @@ var startCmd = &cobra.Command{
 }
 
 func init() {
-	startCmd.Flags().StringVarP(&flagTarget, "target", "t", "target.local.yaml", "target environment YAML")
+	startCmd.Flags().StringVarP(&flagTarget, "target", "t", "target.yaml", "target environment YAML (scaffold one with `make config`)")
 	startCmd.Flags().StringVarP(&flagDeployment, "deployment", "d", "deployment.json", "deployment JSON (from the TS deployer)")
 	startCmd.Flags().StringVarP(&flagOut, "out", "o", "out", "report output directory")
 	startCmd.Flags().StringVar(&flagFailOn, "fail-on", "none", "exit non-zero when the overall verdict meets this threshold: none|fail|review (one-shot only)")

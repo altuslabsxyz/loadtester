@@ -1,14 +1,24 @@
-# stable-loadtester (`loader` CLI)
+# stable-loadtester (`loadtester` CLI)
 
 Standalone QA harness for the Stable chain, as a cobra CLI. **Not** part of the
 chain release. Lives beside the `stable` repo (depends on it via a local
 `replace ../stable` in go.mod).
 
 ```bash
-go build -o loader .          # or: go install ./...
-./loader start --target target.local.yaml --deployment deployment.json --out out
-./loader start --help
+make install              # build + install `loadtester` onto PATH (go install)
+make config               # scaffold an editable target.yaml from target.example.yaml
+$EDITOR target.yaml       # set your endpoints, master key, workload mix
+loadtester start          # reads target.yaml by default
+loadtester start --help
+
+# alternatives
+make build                # build into ./bin/loadtester (no install)
+loadtester start -t target.testnet.yaml -d deployment.json -o out --fail-on fail
 ```
+
+`make config` copies `target.example.yaml` (a fully commented template of every
+settable value) to `target.yaml` (git-ignored) and never overwrites an existing
+one. `loadtester start` defaults to `--target target.yaml`.
 
 Verifies three things under load:
 
@@ -53,15 +63,15 @@ npx hardhat run /abs/path/stable-loadtester/ts/deploy.ts --network stable
 
 This writes `deployment.json` (factory, pool, tokens, callee, destructible).
 
-## Step 2 - run the load test (`loader`)
+## Step 2 - run the load test (`loadtester`)
 
 ```bash
-go build -o loader .
-./loader start -t target.local.yaml -d deployment.json -o out
+make install
+loadtester start -t target.yaml -d deployment.json -o out
 ```
 
-Flags: `-t/--target` (default `target.local.yaml`), `-d/--deployment` (default
-`deployment.json`), `-o/--out` (default `out`).
+Flags: `-t/--target` (default `target.yaml`), `-d/--deployment` (default
+`deployment.json`), `-o/--out` (default `out`), `--fail-on` (`none|fail|review`).
 
 Phases: connect + chainId sanity check → fund N accounts → mint/approve test
 tokens → register lanes (governance) → start collectors → drive workloads for
@@ -115,7 +125,7 @@ CometBFT RPC, no gRPC, and no validator keys. The harness degrades to that:
    against a bare endpoint. To enable `erc20Transfer`/`swap`, first deploy the
    harness `TestERC20`/pool via the TS deployer and point `deployment.json` at it
    (otherwise the mint reverts and setup aborts with a clear error).
-4. `loader start -t target.testnet.yaml` (continuous by default). For CI, run a
+4. `loadtester start -t target.yaml` (continuous by default). For CI, run a
    one-shot (`durationSec > 0`) with `--fail-on=fail` (or `review`).
 
 What is observable on a JSON-RPC-only target:
@@ -134,8 +144,8 @@ What is observable on a JSON-RPC-only target:
 
 `report.json` includes a `verdicts` block (`goal1`/`goal2`/`goal3`/`overall`,
 each PASS/FAIL/REVIEW/INCONCLUSIVE/NOT_EVALUATED/LIVE). `--fail-on=fail|review`
-makes `loader start` exit non-zero when the overall verdict meets the threshold
-(one-shot only; continuous runs are LIVE and never trip it).
+makes `loadtester start` exit non-zero when the overall verdict meets the
+threshold (one-shot only; continuous runs are LIVE and never trip it).
 
 ### One-shot vs continuous
 
