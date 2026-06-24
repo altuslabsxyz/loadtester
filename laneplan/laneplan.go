@@ -8,13 +8,156 @@ package laneplan
 import (
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"strings"
+
+	"github.com/ethereum/go-ethereum/common"
 
 	"github.com/stablelabs/loadtester/config"
 	"github.com/stablelabs/loadtester/deployment"
 	"github.com/stablelabs/loadtester/workload"
 	stabletypes "github.com/stablelabs/stable/x/stable/types"
 )
+
+// Reconcile compares the (resolved) declared plan against the on-chain params.
+// It returns lane ids declared but ABSENT on-chain (missing) and ids present but
+// whose effective params DIFFER (mismatched: weight or, for tx-type lanes, the
+// matchers). The lane Name is ignored (cosmetic). This is what lets the report
+// say a preconfigured target's declared lanes truly match what's registered -
+// matching on id alone would miss a wrong weight (=> wrong quota) or matcher.
+func Reconcile(p *Plan, onchain *stabletypes.Params) (missing, mismatched []int32) {
+	vip := make(map[int32]stabletypes.VipLaneParam, len(onchain.VipLanes))
+	for _, l := range onchain.VipLanes {
+		vip[l.Id] = l
+	}
+	txt := make(map[int32]stabletypes.TxTypeLaneParam, len(onchain.TxTypeLanes))
+	for _, l := range onchain.TxTypeLanes {
+		txt[l.Id] = l
+	}
+	for _, l := range p.VipLanes {
+		oc, ok := vip[l.Id]
+		switch {
+		case !ok:
+			missing = append(missing, l.Id)
+		case oc.Weight != l.Weight:
+			mismatched = append(mismatched, l.Id)
+		}
+	}
+	for _, l := range p.TxTypeLanes {
+		oc, ok := txt[l.Id]
+		if !ok {
+			missing = append(missing, l.Id)
+			continue
+		}
+		if !sameTxTypeLane(l, oc) {
+			mismatched = append(mismatched, l.Id)
+		}
+	}
+	return missing, mismatched
+}
+
+// sameTxTypeLane compares the FUNCTIONAL params of two tx-type lanes (ignoring
+// the cosmetic Name). Matcher slices are OR-combined and stored verbatim by the
+// chain, so the comparison is order-independent; addresses are normalized so
+// checksum-vs-lowercase doesn't read as a difference. (A naive reflect.DeepEqual
+// would falsely flag a correct config whose address casing or matcher order
+// differs from the on-chain encoding.)
+func sameTxTypeLane(a, b stabletypes.TxTypeLaneParam) bool {
+	if a.Weight != b.Weight || a.NoOverflow != b.NoOverflow {
+		return false
+	}
+	return sameAddrSet(a.ToAddrs, b.ToAddrs) &&
+		sameAddrSet(a.Senders, b.Senders) &&
+		sameStrSet(methodHexes(a.Methods), methodHexes(b.Methods)) &&
+		sameTxFormatSet(a.TxTypes, b.TxTypes) &&
+		sameU64Set(a.NonceKeys, b.NonceKeys)
+}
+
+func sameAddrSet(a, b []string) bool {
+	// common.HexToAddress is silent/lossy (invalid/short/over-length strings
+	// collapse to zero/truncated/padded with no error), so a typo'd DECLARED
+	// address could otherwise false-match. Reject any non-address up front: an
+	// unparseable address cannot legitimately equal a validated on-chain one.
+	na, okA := normAddrs(a)
+	nb, okB := normAddrs(b)
+	if !okA || !okB {
+		return false
+	}
+	return sameStrSet(na, nb)
+}
+
+func normAddrs(in []string) ([]string, bool) {
+	out := make([]string, len(in))
+	for i, s := range in {
+		if !common.IsHexAddress(s) {
+			return nil, false
+		}
+		out[i] = common.HexToAddress(s).Hex() // canonical checksum form
+	}
+	return out, true
+}
+
+func methodHexes(in [][]byte) []string {
+	out := make([]string, len(in))
+	for i, m := range in {
+		out[i] = hex.EncodeToString(m)
+	}
+	return out
+}
+
+func sameStrSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	a = append([]string(nil), a...)
+	b = append([]string(nil), b...)
+	sort.Strings(a)
+	sort.Strings(b)
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func sameTxFormatSet(a, b []stabletypes.TxFormat) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	ia := make([]int, len(a))
+	for i, v := range a {
+		ia[i] = int(v)
+	}
+	ib := make([]int, len(b))
+	for i, v := range b {
+		ib[i] = int(v)
+	}
+	sort.Ints(ia)
+	sort.Ints(ib)
+	for i := range ia {
+		if ia[i] != ib[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func sameU64Set(a, b []uint64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	a = append([]uint64(nil), a...)
+	b = append([]uint64(nil), b...)
+	sort.Slice(a, func(i, j int) bool { return a[i] < a[j] })
+	sort.Slice(b, func(i, j int) bool { return b[i] < b[j] })
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
 
 // LaneNormalID mirrors blockspace.LaneNormal (max int32). Txs matching no lane
 // fall here. Used as the "expected lane" for unmatched workloads.

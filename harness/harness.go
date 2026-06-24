@@ -111,11 +111,18 @@ func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string)
 	log.Printf("[lanes] effective params: %d vip, %d tx-type lanes, weight=%d%%",
 		len(effParams.VipLanes), len(effParams.TxTypeLanes), effParams.MaxBlockspaceGasWeight)
 
-	// VIP nonce-key bit must match a lane id actually registered ON-CHAIN. Prefer
-	// the declared/preset VIP id if it exists on-chain; otherwise fall back to the
-	// first on-chain VIP lane (with a warning). The tool can only drive ONE VIP
-	// lane, so note when several exist.
-	if len(effParams.VipLanes) > 0 {
+	// VIP nonce-key bit must match a lane id actually registered ON-CHAIN. Only
+	// relevant if a VIP lane is declared OR the vip workload runs - otherwise stay
+	// silent (no spurious "VIP id 0 not on-chain" noise).
+	vipDeclared := len(plan.VipLanes) > 0
+	vipWorkload := false
+	if l, ok := tgt.Workload.Lanes[string(workload.KindVIP)]; ok && (l.Enabled == nil || *l.Enabled) {
+		vipWorkload = true
+	}
+	switch {
+	case (vipDeclared || vipWorkload) && len(effParams.VipLanes) > 0:
+		// Prefer the declared/preset VIP id if it exists on-chain; else fall back
+		// to the first on-chain VIP lane (warn). The tool drives only ONE VIP lane.
 		want := plan.ExpectedLane[workload.KindVIP]
 		chosen, found := effParams.VipLanes[0].Id, false
 		for _, vl := range effParams.VipLanes {
@@ -124,37 +131,33 @@ func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string)
 				break
 			}
 		}
-		if !found {
+		if vipDeclared && !found {
 			log.Printf("[lanes] WARNING: declared VIP lane id %d not on-chain; using on-chain VIP lane %d", want, chosen)
 		}
 		if len(effParams.VipLanes) > 1 {
 			log.Printf("[lanes] NOTE: %d VIP lanes on-chain; only lane %d will receive VIP traffic", len(effParams.VipLanes), chosen)
 		}
 		builder.SetVIPLane(chosen)
+	case vipWorkload && len(effParams.VipLanes) == 0:
+		log.Printf("[lanes] WARNING: vip workload enabled but no VIP lane on-chain - VIP txs won't be lane-classified")
 	}
+
 	// Reconcile config-declared lanes against on-chain params (only meaningful
-	// when params are verified, i.e. gRPC available). Surfaces a config that
-	// declares lanes not actually registered - the operator's stated lanes are
-	// what they expect to verify, so a mismatch must be loud.
+	// when params are verified, i.e. gRPC available). Compares the FULL params
+	// (id + weight + matchers), not just ids - a wrong weight (=> wrong quota) or
+	// matcher must be flagged, since those are exactly what the operator expects
+	// the tool to verify against on a preconfigured target.
 	lanesReconciled := paramsVerified
 	if paramsVerified && len(tgt.Blockspace.Lanes) > 0 {
-		onchain := map[int32]bool{}
-		for _, l := range effParams.VipLanes {
-			onchain[l.Id] = true
-		}
-		for _, l := range effParams.TxTypeLanes {
-			onchain[l.Id] = true
-		}
-		var missing []int32
-		for _, l := range tgt.Blockspace.Lanes {
-			if !onchain[l.ID] {
-				missing = append(missing, l.ID)
-			}
-		}
+		missing, mismatched := laneplan.Reconcile(plan, effParams)
 		if len(missing) > 0 {
 			lanesReconciled = false
-			log.Printf("[lanes] WARNING: declared lanes NOT found on-chain: %v - "+
-				"Goal 1 for those lanes is meaningless; fix the target YAML", missing)
+			log.Printf("[lanes] WARNING: declared lanes NOT found on-chain: %v - fix the target YAML", missing)
+		}
+		if len(mismatched) > 0 {
+			lanesReconciled = false
+			log.Printf("[lanes] WARNING: declared lanes differ from on-chain (weight/matchers): %v - "+
+				"Goal 1 for those lanes verifies the ON-CHAIN params, not your YAML; fix the target YAML", mismatched)
 		}
 	}
 
