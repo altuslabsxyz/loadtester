@@ -14,6 +14,14 @@ The tool is the `loadtester` binary in this repo. This skill runs it and turns
 `out/report.json` into a one-shot verdict, and (optionally) spawns a read-only
 chain-side monitor that reports chain problems independent of the load result.
 
+## Focused sub-skills (use the one that matches the task)
+- **loadtest-setup** — configure target.yaml, build, cap spend, preflight.
+- **loadtest-send** — run `loadtester start`, workload kinds, watch a run.
+- **loadtest-verify** — read report.json verdicts, decide PASS/FAIL/REVIEW, chain-health monitor.
+- **loadtest-diagnose-chain** — when a result implies a CHAIN bug, drive read-only chain-code investigation agents to localize it.
+
+This skill is the end-to-end overview; the references below are shared by all of them.
+
 ## Read these as needed
 - `reference.md` — how it works + the stable-chain facts that drive behavior
   (CList-only mempool, 1-in-flight nonces, decimals, TxProvider inclusion, VIP,
