@@ -14,6 +14,15 @@ The tool is the `loadtester` binary in this repo. This skill runs it and turns
 `out/report.json` into a one-shot verdict, and (optionally) spawns a read-only
 chain-side monitor that reports chain problems independent of the load result.
 
+## Read these as needed
+- `reference.md` — how it works + the stable-chain facts that drive behavior
+  (CList-only mempool, 1-in-flight nonces, decimals, TxProvider inclusion, VIP,
+  proposer logs, gov modes, verdict vocabulary, known limitations). Read this to
+  understand WHY a run produces its verdicts.
+- `config.md` — full `target.yaml` schema, the workload kinds, how to send txs,
+  how to CAP spend, the preconfigured-testnet procedure, and worked examples.
+- `chain-monitor.md` — subagent prompt template for the independent chain-health monitor.
+
 ## When to use
 - "Load-test the stable chain at <target>." / "Verify lanes on the testnet."
 - "Does the chain drain / stay deterministic under load?"
