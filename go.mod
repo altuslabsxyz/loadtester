@@ -7,7 +7,7 @@ require (
 	github.com/ethereum/go-ethereum v1.16.5
 	github.com/holiman/uint256 v1.3.2
 	github.com/spf13/cobra v1.10.2
-	github.com/stablelabs/stable v0.0.0-20260616141150-4744d2d67a57
+	github.com/stablelabs/stable v1.8.0-rc0
 	google.golang.org/grpc v1.78.0
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -282,12 +282,12 @@ require (
 
 // Mirror stable's fork replaces so the shared deps resolve identically.
 replace (
-	cosmossdk.io/log => github.com/stablelabs/stable-sdk/log v0.0.0-20260608105015-28965adbf53e
-	cosmossdk.io/store => github.com/stablelabs/stable-sdk/store v0.0.0-20260608105015-28965adbf53e
-	github.com/cometbft/cometbft => github.com/stablelabs/stable-bft v0.0.0-20260616124316-4bdfe865e5ba
-	github.com/cosmos/cosmos-sdk => github.com/stablelabs/stable-sdk v0.0.0-20260609122012-dea76f7f4fff
-	github.com/cosmos/evm => github.com/stablelabs/stable-evm v0.0.0-20260609122028-867293196951
-	github.com/ethereum/go-ethereum => github.com/stablelabs/stable-geth v0.0.0-20260507051849-4d239de89a0d
+	cosmossdk.io/log => github.com/stablelabs/stable-sdk/log v0.0.0-20260714013335-0dece2715202
+	cosmossdk.io/store => github.com/stablelabs/stable-sdk/store v0.0.0-20260714013335-0dece2715202
+	github.com/cometbft/cometbft => github.com/stablelabs/stable-bft v0.0.0-20260714062140-8a25be328e6b
+	github.com/cosmos/cosmos-sdk => github.com/stablelabs/stable-sdk v0.0.0-20260714013335-0dece2715202
+	github.com/cosmos/evm => github.com/stablelabs/stable-evm v0.0.0-20260714072442-5e6d25134bd7
+	github.com/ethereum/go-ethereum => github.com/stablelabs/stable-geth v1.16.2-stable-1.0.20260701052850-fbbf9345c3f2
 )
 
 replace (

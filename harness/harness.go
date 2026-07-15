@@ -108,38 +108,38 @@ func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string)
 	if !paramsVerified {
 		log.Printf("[lanes] WARNING: no gRPC - lane params ASSUMED from config, not verified on-chain")
 	}
-	log.Printf("[lanes] effective params: %d vip, %d tx-type lanes, weight=%d%%",
-		len(effParams.VipLanes), len(effParams.TxTypeLanes), effParams.MaxBlockspaceGasWeight)
+	log.Printf("[lanes] effective params: %d enterprise, %d tx-type lanes, weight=%d%%",
+		len(effParams.EnterpriseLanes), len(effParams.TxTypeLanes), effParams.MaxBlockspaceGasWeight)
 
-	// VIP nonce-key bit must match a lane id actually registered ON-CHAIN. Only
-	// relevant if a VIP lane is declared OR the vip workload runs - otherwise stay
-	// silent (no spurious "VIP id 0 not on-chain" noise).
-	vipDeclared := len(plan.VipLanes) > 0
-	vipWorkload := false
-	if l, ok := tgt.Workload.Lanes[string(workload.KindVIP)]; ok && (l.Enabled == nil || *l.Enabled) {
-		vipWorkload = true
+	// Enterprise nonce-key bit must match a lane id actually registered ON-CHAIN. Only
+	// relevant if an enterprise lane is declared OR the enterprise workload runs - otherwise stay
+	// silent (no spurious "Enterprise id 0 not on-chain" noise).
+	enterpriseDeclared := len(plan.EnterpriseLanes) > 0
+	enterpriseWorkload := false
+	if l, ok := tgt.Workload.Lanes[string(workload.KindEnterprise)]; ok && (l.Enabled == nil || *l.Enabled) {
+		enterpriseWorkload = true
 	}
 	switch {
-	case (vipDeclared || vipWorkload) && len(effParams.VipLanes) > 0:
-		// Prefer the declared/preset VIP id if it exists on-chain; else fall back
-		// to the first on-chain VIP lane (warn). The tool drives only ONE VIP lane.
-		want := plan.ExpectedLane[workload.KindVIP]
-		chosen, found := effParams.VipLanes[0].Id, false
-		for _, vl := range effParams.VipLanes {
+	case (enterpriseDeclared || enterpriseWorkload) && len(effParams.EnterpriseLanes) > 0:
+		// Prefer the declared/preset Enterprise id if it exists on-chain; else fall back
+		// to the first on-chain Enterprise lane (warn). The tool drives only ONE Enterprise lane.
+		want := plan.ExpectedLane[workload.KindEnterprise]
+		chosen, found := effParams.EnterpriseLanes[0].Id, false
+		for _, vl := range effParams.EnterpriseLanes {
 			if vl.Id == want {
 				chosen, found = want, true
 				break
 			}
 		}
-		if vipDeclared && !found {
-			log.Printf("[lanes] WARNING: declared VIP lane id %d not on-chain; using on-chain VIP lane %d", want, chosen)
+		if enterpriseDeclared && !found {
+			log.Printf("[lanes] WARNING: declared Enterprise lane id %d not on-chain; using on-chain Enterprise lane %d", want, chosen)
 		}
-		if len(effParams.VipLanes) > 1 {
-			log.Printf("[lanes] NOTE: %d VIP lanes on-chain; only lane %d will receive VIP traffic", len(effParams.VipLanes), chosen)
+		if len(effParams.EnterpriseLanes) > 1 {
+			log.Printf("[lanes] NOTE: %d Enterprise lanes on-chain; only lane %d will receive Enterprise traffic", len(effParams.EnterpriseLanes), chosen)
 		}
-		builder.SetVIPLane(chosen)
-	case vipWorkload && len(effParams.VipLanes) == 0:
-		log.Printf("[lanes] WARNING: vip workload enabled but no VIP lane on-chain - VIP txs won't be lane-classified")
+		builder.SetEnterpriseLane(chosen)
+	case enterpriseWorkload && len(effParams.EnterpriseLanes) == 0:
+		log.Printf("[lanes] WARNING: enterprise workload enabled but no Enterprise lane on-chain - Enterprise txs won't be lane-classified")
 	}
 
 	// Reconcile config-declared lanes against on-chain params (only meaningful

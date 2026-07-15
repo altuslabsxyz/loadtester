@@ -16,9 +16,11 @@ import (
 type Role string
 
 const (
-	RoleValidator Role = "validator"
-	RoleFullnode  Role = "fullnode"
-	RoleVIP       Role = "vip"
+	RoleValidator  Role = "validator"
+	RoleFullnode   Role = "fullnode"
+	RoleGuaranteed Role = "guaranteed"
+	RoleEnterprise Role = "enterprise"
+	RoleVIP        Role = "vip" // legacy target compatibility
 )
 
 // GovMode selects how Tx-Type lanes get registered.
@@ -109,7 +111,8 @@ type LaneDef struct {
 	ID         int32    `yaml:"id"`
 	Name       string   `yaml:"name"`
 	Weight     uint32   `yaml:"weight"`
-	VIP        bool     `yaml:"vip"`
+	Enterprise bool     `yaml:"enterprise"`
+	VIP        bool     `yaml:"vip"` // legacy target compatibility
 	ToAddrs    []string `yaml:"toAddrs"`
 	Methods    []string `yaml:"methods"`
 	TxTypes    []string `yaml:"txTypes"` // LEGACY|ACCESS_LIST|DYNAMIC_FEE|SET_CODE|TWO_D_NONCE
@@ -160,6 +163,11 @@ func Load(path string) (*Target, error) {
 }
 
 func (t *Target) applyDefaults() {
+	for i := range t.Blockspace.Lanes {
+		isEnterprise := t.Blockspace.Lanes[i].Enterprise || t.Blockspace.Lanes[i].VIP
+		t.Blockspace.Lanes[i].Enterprise = isEnterprise
+		t.Blockspace.Lanes[i].VIP = isEnterprise
+	}
 	if t.Observe.PollIntervalMs == 0 {
 		t.Observe.PollIntervalMs = 200
 	}
@@ -218,13 +226,11 @@ func (t *Target) PrimaryJSONRPC() string {
 	return t.Nodes[0].JSONRPC
 }
 
-// VIPJSONRPC returns the JSON-RPC endpoint VIP txs must be sent to: the first
-// node with role "vip". VIP (2D-nonce) txs are only accepted by that node, so
-// when no vip-role node is configured this returns "" and the harness skips the
-// VIP workload entirely.
+// VIPJSONRPC returns the dedicated JSON-RPC endpoint for guaranteed Enterprise
+// transactions. The legacy name is retained for target compatibility.
 func (t *Target) VIPJSONRPC() string {
 	for _, n := range t.Nodes {
-		if n.Role == RoleVIP && strings.TrimSpace(n.JSONRPC) != "" {
+		if (n.Role == RoleGuaranteed || n.Role == RoleEnterprise || n.Role == RoleVIP) && strings.TrimSpace(n.JSONRPC) != "" {
 			return n.JSONRPC
 		}
 	}

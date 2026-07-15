@@ -26,16 +26,16 @@ import (
 // say a preconfigured target's declared lanes truly match what's registered -
 // matching on id alone would miss a wrong weight (=> wrong quota) or matcher.
 func Reconcile(p *Plan, onchain *stabletypes.Params) (missing, mismatched []int32) {
-	vip := make(map[int32]stabletypes.VipLaneParam, len(onchain.VipLanes))
-	for _, l := range onchain.VipLanes {
-		vip[l.Id] = l
+	enterprise := make(map[int32]stabletypes.EnterpriseLaneParam, len(onchain.EnterpriseLanes))
+	for _, l := range onchain.EnterpriseLanes {
+		enterprise[l.Id] = l
 	}
 	txt := make(map[int32]stabletypes.TxTypeLaneParam, len(onchain.TxTypeLanes))
 	for _, l := range onchain.TxTypeLanes {
 		txt[l.Id] = l
 	}
-	for _, l := range p.VipLanes {
-		oc, ok := vip[l.Id]
+	for _, l := range p.EnterpriseLanes {
+		oc, ok := enterprise[l.Id]
 		switch {
 		case !ok:
 			missing = append(missing, l.Id)
@@ -167,13 +167,13 @@ const LaneNormalID int32 = 1<<31 - 1
 const (
 	LaneIDERC20Transfer int32 = 10
 	LaneIDUniswapSwap   int32 = 20
-	LaneIDVIP           int32 = 1
+	LaneIDEnterprise    int32 = 1
 )
 
 // Plan is the resolved lane configuration plus the workload->lane mapping.
 type Plan struct {
 	MaxBlockspaceGasWeight uint32
-	VipLanes               []stabletypes.VipLaneParam
+	EnterpriseLanes        []stabletypes.EnterpriseLaneParam
 	TxTypeLanes            []stabletypes.TxTypeLaneParam
 
 	// ExpectedLane maps a workload kind to the lane id its txs should land in.
@@ -186,7 +186,7 @@ type Plan struct {
 //   - reserved pool = 50% of max block gas (MaxBlockspaceGasWeight=50)
 //   - erc20-transfer lane: to=tokens[0], method=transfer selector, weight 30
 //   - uniswap-swap lane:   to=callee,    method=swapExact0For1,    weight 20
-//   - vip lane:            weight 20
+//   - enterprise lane:     weight 20
 //
 // weight sum (30+20+20=70) stays <= 100 as required by params validation.
 func Build(d *deployment.Deployment, abis *workload.ABIs) *Plan {
@@ -199,13 +199,13 @@ func Build(d *deployment.Deployment, abis *workload.ABIs) *Plan {
 		},
 	}
 
-	// VIP lane (matched by nonce-key VIP bit, not by tx fields).
-	p.VipLanes = append(p.VipLanes, stabletypes.VipLaneParam{
-		Id:     LaneIDVIP,
-		Name:   "lt-vip",
+	// Enterprise lane (matched by nonce-key Enterprise bit, not by tx fields).
+	p.EnterpriseLanes = append(p.EnterpriseLanes, stabletypes.EnterpriseLaneParam{
+		Id:     LaneIDEnterprise,
+		Name:   "lt-enterprise",
 		Weight: 20,
 	})
-	p.ExpectedLane[workload.KindVIP] = LaneIDVIP
+	p.ExpectedLane[workload.KindEnterprise] = LaneIDEnterprise
 
 	transferSel := workload.Selector(abis.ERC20, "transfer")
 	swapSel := workload.Selector(abis.Callee, "swapExact0For1")
@@ -243,7 +243,7 @@ func Build(d *deployment.Deployment, abis *workload.ABIs) *Plan {
 func (p *Plan) Params() stabletypes.Params {
 	return stabletypes.Params{
 		EnableGasWaiver:        false,
-		VipLanes:               p.VipLanes,
+		EnterpriseLanes:        p.EnterpriseLanes,
 		TxTypeLanes:            p.TxTypeLanes,
 		MaxBlockspaceGasWeight: p.MaxBlockspaceGasWeight,
 	}
@@ -266,8 +266,8 @@ func BuildFromConfig(bs config.Blockspace, d *deployment.Deployment) (*Plan, err
 		},
 	}
 	for _, l := range bs.Lanes {
-		if l.VIP {
-			p.VipLanes = append(p.VipLanes, stabletypes.VipLaneParam{
+		if l.Enterprise {
+			p.EnterpriseLanes = append(p.EnterpriseLanes, stabletypes.EnterpriseLaneParam{
 				Id: l.ID, Name: l.Name, Weight: l.Weight,
 			})
 			continue
@@ -303,8 +303,8 @@ func BuildFromConfig(bs config.Blockspace, d *deployment.Deployment) (*Plan, err
 	// VIP workload's nonce-key lane id must be known up front to BUILD its txs
 	// (cannot be derived by classifying, which is circular). Take the first VIP
 	// lane. Other kinds' expected lane is derived later via the classifier.
-	for _, v := range p.VipLanes {
-		p.ExpectedLane[workload.KindVIP] = v.Id
+	for _, v := range p.EnterpriseLanes {
+		p.ExpectedLane[workload.KindEnterprise] = v.Id
 		break
 	}
 	return p, nil

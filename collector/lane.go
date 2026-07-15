@@ -65,7 +65,7 @@ type LaneCollector struct {
 func NewLaneCollector(client *ethclient.Client, classifier *Classifier, params *stabletypes.Params, maxBlockGas uint64) *LaneCollector {
 	names := map[int32]string{laneNormalID: "normal"}
 	quota := map[int32]uint64{}
-	for _, v := range params.VipLanes {
+	for _, v := range params.EnterpriseLanes {
 		names[v.Id] = v.Name
 		quota[v.Id] = MaxGasForLane(params, v.Id, maxBlockGas)
 	}

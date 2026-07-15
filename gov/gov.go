@@ -103,15 +103,15 @@ func (r *Registrar) Register(ctx context.Context, mode config.GovMode, plan *lan
 	// reuse them. Lets continuous runs reattach without re-proposing.
 	if r.grpc != "" {
 		if p, err := QueryParams(ctx, r.grpc); err == nil {
-			wantVip := make([]int32, 0, len(plan.VipLanes))
-			for _, l := range plan.VipLanes {
-				wantVip = append(wantVip, l.Id)
+			wantEnterprise := make([]int32, 0, len(plan.EnterpriseLanes))
+			for _, l := range plan.EnterpriseLanes {
+				wantEnterprise = append(wantEnterprise, l.Id)
 			}
 			wantTx := make([]int32, 0, len(plan.TxTypeLanes))
 			for _, l := range plan.TxTypeLanes {
 				wantTx = append(wantTx, l.Id)
 			}
-			if hasLanes(p, wantVip, wantTx) {
+			if hasLanes(p, wantEnterprise, wantTx) {
 				return p, nil
 			}
 		}
@@ -251,9 +251,9 @@ func (r *Registrar) waitReceipt(ctx context.Context, hash common.Hash, timeout t
 }
 
 func (r *Registrar) waitForLanes(ctx context.Context, plan *laneplan.Plan, timeout time.Duration) error {
-	wantVip := make([]int32, 0, len(plan.VipLanes))
-	for _, l := range plan.VipLanes {
-		wantVip = append(wantVip, l.Id)
+	wantEnterprise := make([]int32, 0, len(plan.EnterpriseLanes))
+	for _, l := range plan.EnterpriseLanes {
+		wantEnterprise = append(wantEnterprise, l.Id)
 	}
 	wantTx := make([]int32, 0, len(plan.TxTypeLanes))
 	for _, l := range plan.TxTypeLanes {
@@ -265,7 +265,7 @@ func (r *Registrar) waitForLanes(ctx context.Context, plan *laneplan.Plan, timeo
 			return ctx.Err()
 		}
 		p, err := QueryParams(ctx, r.grpc)
-		if err == nil && hasLanes(p, wantVip, wantTx) {
+		if err == nil && hasLanes(p, wantEnterprise, wantTx) {
 			return nil
 		}
 		time.Sleep(2 * time.Second)

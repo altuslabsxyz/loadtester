@@ -35,7 +35,7 @@ func QueryParams(ctx context.Context, grpcEndpoint string) (*stabletypes.Params,
 // hasLanes reports whether p contains all lane ids in want.
 func hasLanes(p *stabletypes.Params, wantVip []int32, wantTxType []int32) bool {
 	have := make(map[int32]struct{})
-	for _, l := range p.VipLanes {
+	for _, l := range p.EnterpriseLanes {
 		have[l.Id] = struct{}{}
 	}
 	for _, l := range p.TxTypeLanes {

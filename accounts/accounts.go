@@ -292,12 +292,16 @@ func (p *Pool) SignStandard(a *Account, nonce uint64, to *common.Address, value 
 }
 
 // SignVIP builds and signs a stable-geth 2D-nonce (CustomTx) tx whose nonce key
-// carries the VIP bit for the given lane id, routing it to that VIP lane.
+// carries the Enterprise bit for the given lane ID. The method retains its
+// legacy name because target YAML and workload kinds still use "vip".
 func (p *Pool) SignVIP(a *Account, nonce uint64, laneID int32, to *common.Address, value *big.Int, data []byte, gas uint64, feeCap, tip *big.Int) (*types.Transaction, error) {
+	if laneID < 0 {
+		return nil, fmt.Errorf("enterprise lane ID must be non-negative: %d", laneID)
+	}
 	if value == nil {
 		value = big.NewInt(0)
 	}
-	nonceKey := stabletypes.VipFlag | uint64(laneID) // VIP bit set, lane id in lower 63 bits
+	nonceKey := stabletypes.EnterpriseFlag | uint64(laneID)
 	chainID, _ := uint256.FromBig(p.ChainID)
 	val, _ := uint256.FromBig(value)
 	feeCapU, _ := uint256.FromBig(feeCap)

@@ -27,7 +27,8 @@ const (
 	KindValue         Kind = "value"         // native value transfer -> LaneNormal
 	KindERC20Transfer Kind = "erc20Transfer" // token transfer -> erc20 lane
 	KindSwap          Kind = "swap"          // callee swap -> uniswap-swap lane
-	KindVIP           Kind = "vip"           // 2D-nonce VIP tx -> vip lane
+	KindEnterprise    Kind = "vip"           // legacy YAML key for Enterprise traffic
+	KindVIP                = KindEnterprise  // legacy Go API compatibility
 	KindBump          Kind = "bump"          // same-slot contention -> LaneNormal
 	KindSelfDestruct  Kind = "selfdestruct"  // create+selfdestruct -> LaneNormal
 	KindUnordered     Kind = "unordered"     // 2D-nonce unordered/timeout tx (STAB-185 path)
@@ -188,10 +189,12 @@ var AllKinds = []Kind{
 // the on-chain params).
 func (b *Builder) SetExpectedLane(m map[Kind]int32) { b.expectedLane = m }
 
-// SetVIPLane sets the VIP lane id used for the VIP nonce-key bit. It must match
-// the lane id actually registered ON-CHAIN (not the YAML), or VIP txs land in
-// the wrong/normal lane. Called after the effective params are read from chain.
-func (b *Builder) SetVIPLane(id int32) { b.expectedLane[KindVIP] = id }
+// SetEnterpriseLane sets the on-chain lane ID encoded into Enterprise nonce
+// keys. It must match the effective chain parameters, not merely the YAML.
+func (b *Builder) SetEnterpriseLane(id int32) { b.expectedLane[KindEnterprise] = id }
+
+// SetVIPLane retains the legacy Go API name.
+func (b *Builder) SetVIPLane(id int32) { b.SetEnterpriseLane(id) }
 
 // DeriveExpectedLanes computes each supported kind's expected lane by building a
 // representative tx and classifying it with the provided function (the chain's
@@ -210,12 +213,12 @@ func (b *Builder) DeriveExpectedLanes(classify func(*types.Transaction) int32, a
 	}
 }
 
-// NonceKey returns the 2D-nonce key a kind's txs use: VIP txs carry the VIP
-// bit + lane id; everything else uses the standard key 0.
+// NonceKey returns the 2D-nonce key a kind's txs use: the legacy VIP workload
+// carries the Enterprise bit plus lane ID; everything else uses key 0.
 func (b *Builder) NonceKey(k Kind) uint64 {
 	switch k {
 	case KindVIP:
-		return stabletypes.VipFlag | uint64(vipLaneID(b.expectedLane))
+		return stabletypes.EnterpriseFlag | uint64(vipLaneID(b.expectedLane))
 	case KindUnordered:
 		return math.MaxUint64
 	default:

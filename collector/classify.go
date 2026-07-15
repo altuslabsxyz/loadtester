@@ -38,8 +38,8 @@ func (c *Classifier) PrimaryLane(tx *ethtypes.Transaction) int32 {
 	}
 	nonceKey := tx.NonceKey()
 	if isVip(nonceKey) {
-		vipID := int32(nonceKey & stabletypes.VipMask)
-		for _, v := range c.params.VipLanes {
+		vipID := int32(nonceKey & stabletypes.EnterpriseMask)
+		for _, v := range c.params.EnterpriseLanes {
 			if v.Id == vipID {
 				return v.Id
 			}
@@ -69,7 +69,7 @@ func (c *Classifier) PrimaryLane(tx *ethtypes.Transaction) int32 {
 }
 
 func isVip(nonceKey uint64) bool {
-	return nonceKey != math.MaxUint64 && nonceKey&stabletypes.VipFlag != 0
+	return nonceKey != math.MaxUint64 && nonceKey&stabletypes.EnterpriseFlag != 0
 }
 
 func (c *Classifier) matches(tx *ethtypes.Transaction, nonceKey uint64, lane stabletypes.TxTypeLaneParam) bool {
@@ -193,7 +193,7 @@ func MaxGasForLane(params *stabletypes.Params, laneID int32, maxBlockGas uint64)
 }
 
 func weightForLane(params *stabletypes.Params, laneID int32) uint32 {
-	for _, v := range params.VipLanes {
+	for _, v := range params.EnterpriseLanes {
 		if v.Id == laneID {
 			return v.Weight
 		}
