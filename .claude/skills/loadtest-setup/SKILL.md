@@ -19,11 +19,11 @@ load is `loadtest-send`, interpreting results is `loadtest-verify`.
    - `governance.mode`: **preconfigured** for a testnet (lanes already registered; declare them in `blockspace.lanes` if you want lane verification). fast-pass/real-vote only on a local chain you control.
    - `workload.lanes`: token-free = `value`/`vip`/`unordered` (empty `deployment.json {}`). erc20/swap need a deployed mintable token. Keep `allowDestructive: false`.
    - `workload.durationSec`: **> 0** to get a verdict; `<= 0` is continuous (no verdict).
-3. **Cap spend** (critical on a real funded account): master outflow `= accountsN × fundPerAccount` in WHOLE gas tokens (`fundPerAccount:"1"` = 1 token = 1e18 atomic). Set the product ≤ your budget. Funds go to throwaway accounts and are NOT recovered — prefer many small accounts (e.g. `50 × 1`) over few large. The master-balance precheck aborts (no spend) if it can't cover `product + gas`.
+3. **Cap spend** (critical on a real funded account): the master must hold `accountsN × fundPerAccount` in gas tokens **available UPFRONT to float** — `fundPerAccount` is DECIMAL whole tokens (`"0.01"`, `"1"`, …; fund only what gas needs, ~0.00002/tx) — the master-balance precheck aborts (no spend) if it can't cover `product + gas`. By default `funding.sweepBack: true` returns each account's leftover to the master at the end of a one-shot run, so the *net* cost is only gas (~cents); the *upfront float* still caps `accountsN` at what the balance can cover. Set `sweepBack: false` to leave funds stranded (then they're unrecoverable — keys are random/in-memory).
 4. **Preflight**: `loadtester config -t target.yaml` — verify chainId, the load + vip endpoints, lane source, `mode`, and that the masked masterKey's derived address is the funded one. Abort on anything wrong.
 
 ## Common mistakes
 - Continuous mode (`durationSec: 0`) when you wanted a PASS/FAIL — it returns LIVE, never a verdict.
 - Setting `grpc` to a TLS endpoint → preconfigured run aborts (insecure-only dial). Leave it empty unless you have a plaintext gRPC.
 - Expecting per-account depth to add load — it can't (1-in-flight); raise `accountsN`.
-- Funding large amounts "to be safe" — it's stranded/spent in random accounts.
+- Assuming `accountsN` is capped by *net* cost — it's capped by the *upfront float* (`accountsN × fundPerAccount` must be on the master before the run, even though sweepBack returns it after).

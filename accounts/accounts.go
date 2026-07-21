@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"fmt"
+	"log"
 	"math"
 	"math/big"
 	"strings"
@@ -189,15 +190,95 @@ func (p *Pool) Fees(ctx context.Context) (*big.Int, *big.Int, error) {
 	return feeCap, tip, nil
 }
 
-// Fund sends `amount` (whole gas tokens) from master to every load account and
-// waits for the funding txs to be mined, then seeds each account's nonce.
-func (p *Pool) Fund(ctx context.Context, amountWholeTokens string) error {
-	amt, ok := new(big.Int).SetString(amountWholeTokens, 10)
-	if !ok {
-		return fmt.Errorf("invalid fund amount %q (expected integer whole-token string)", amountWholeTokens)
+// parseWholeTokensToWei converts a DECIMAL whole-token string to wei (×1e18),
+// exactly (no binary-float error). Accepts "1", "0.01", "2.5", etc. Fractions
+// beyond 18 decimals are truncated (sub-wei). Rejects negative/invalid input.
+// This lets accounts be funded with only the tiny amount they need for gas
+// (~0.00002/tx) instead of a full token, so most of the float isn't tied up.
+func parseWholeTokensToWei(s string) (*big.Int, error) {
+	s = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(s), "+"))
+	if s == "" {
+		return nil, fmt.Errorf("empty fund amount (set funding.fundPerAccount, e.g. \"0.01\")")
 	}
-	// whole token -> wei (18 decimals for native EVM balance)
-	wei := new(big.Int).Mul(amt, new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil))
+	if strings.HasPrefix(s, "-") {
+		return nil, fmt.Errorf("fund amount %q must not be negative", s)
+	}
+	intPart, fracPart, _ := strings.Cut(s, ".")
+	if intPart == "" {
+		intPart = "0"
+	}
+	if len(fracPart) > 18 { // truncate below 1 wei
+		fracPart = fracPart[:18]
+	}
+	fracPart += strings.Repeat("0", 18-len(fracPart)) // pad to 18 decimals
+	wei, ok := new(big.Int).SetString(intPart+fracPart, 10)
+	if !ok {
+		return nil, fmt.Errorf("invalid fund amount %q (expected a decimal whole-token amount, e.g. \"0.01\")", s)
+	}
+	return wei, nil
+}
+
+// fundPair is one transfer in the fan-out funding schedule: sender -1 is the
+// master, any other index is a load account funded in an earlier round.
+type fundPair struct {
+	sender   int
+	receiver int
+}
+
+// fundSchedule builds the fan-out funding rounds for n accounts. The chain
+// admits only nonce == committed nonce per sender (no future-nonce queue), so
+// one sender can fund at most one account per block. Instead of the master
+// funding all n in lockstep (~n blocks), each round the master AND every
+// already-funded account fund one new account each, so the funded set roughly
+// doubles per round: ceil(log2(n+1)) rounds total.
+func fundSchedule(n int) [][]fundPair {
+	var rounds [][]fundPair
+	funded := 0
+	for funded < n {
+		senders := funded + 1 // master + everyone funded in earlier rounds
+		var round []fundPair
+		for s := 0; s < senders && funded < n; s++ {
+			round = append(round, fundPair{sender: s - 1, receiver: funded})
+			funded++
+		}
+		rounds = append(rounds, round)
+	}
+	return rounds
+}
+
+// fundEndowments computes how much each account must RECEIVE: its own
+// perAccount amount plus, for every account it later funds, that child's
+// endowment and one tx of gas. Receivers always have a higher index than their
+// sender and only send in later rounds, so walking rounds in reverse resolves
+// children before their parents. Total master outflow stays exactly
+// n*(perAccount+gasPerTx) - the same float lockstep funding needed.
+func fundEndowments(rounds [][]fundPair, n int, perAccount, gasPerTx *big.Int) []*big.Int {
+	endow := make([]*big.Int, n)
+	for i := range endow {
+		endow[i] = new(big.Int).Set(perAccount)
+	}
+	for r := len(rounds) - 1; r >= 0; r-- {
+		for _, fp := range rounds[r] {
+			if fp.sender >= 0 {
+				endow[fp.sender].Add(endow[fp.sender], endow[fp.receiver])
+				endow[fp.sender].Add(endow[fp.sender], gasPerTx)
+			}
+		}
+	}
+	return endow
+}
+
+// Fund distributes `amount` (decimal whole gas tokens, e.g. "0.01") to every
+// load account via the fan-out tree (see fundSchedule), waiting for each
+// round's txs to mine before the next, then seeds each account's nonce.
+func (p *Pool) Fund(ctx context.Context, amountWholeTokens string) error {
+	wei, err := parseWholeTokensToWei(amountWholeTokens)
+	if err != nil {
+		return err
+	}
+	if wei.Sign() <= 0 {
+		return fmt.Errorf("fund amount %q must be > 0", amountWholeTokens)
+	}
 
 	feeCap, tip, err := p.Fees(ctx)
 	if err != nil {
@@ -221,38 +302,227 @@ func (p *Pool) Fund(ctx context.Context, amountWholeTokens string) error {
 			"fund the master or lower funding.accountsN / fundPerAccount", p.Master.Addr.Hex(), bal, need, n, wei)
 	}
 
-	// Lockstep funding: the master is a single sender, and the chain admits only
-	// nonce == its committed nonce (no future-nonce queue - a gapped nonce is
-	// rejected and dropped). So each funding tx MUST be mined before the next is
-	// sent; blasting them all would get every tx after the first dropped.
-	for i, a := range p.Accs {
-		nonce := p.Master.Next(0)
-		tx := types.NewTx(&types.DynamicFeeTx{
-			ChainID:   p.ChainID,
-			Nonce:     nonce,
-			GasTipCap: tip,
-			GasFeeCap: feeCap,
-			Gas:       21000,
-			To:        &a.Addr,
-			Value:     wei,
-		})
-		signed, err := types.SignTx(tx, p.Signer, p.Master.Key)
-		if err != nil {
-			return fmt.Errorf("sign funding tx: %w", err)
+	// Fan-out funding: within a round every tx has a DISTINCT sender, so the
+	// 1-in-flight-per-sender rule (nonce gaps are rejected, not queued) is never
+	// violated and the whole round lands in ~one block. Rounds are serialized:
+	// a round's receivers become the next round's senders, so their funding txs
+	// must be committed first.
+	//
+	// Broadcasts within a round are SEQUENTIAL, receipts are awaited in
+	// parallel. Concurrent eth_sendRawTransaction can panic the node's CheckTx
+	// when two executions race to create a not-yet-existing account in the fee
+	// path (x/auth "index uniqueness constrain violation", recovered panic, tx
+	// rejected). A broadcast is ~milliseconds, so serializing them costs almost
+	// nothing; the round still mines in ~one block.
+	rounds := fundSchedule(len(p.Accs))
+	endow := fundEndowments(rounds, len(p.Accs), wei, gasPerTx)
+	funded := 0
+	for ri, round := range rounds {
+		type sent struct {
+			hash common.Hash
+			addr common.Address
 		}
-		if err := p.Client.SendTransaction(ctx, signed); err != nil {
-			return fmt.Errorf("send funding tx %d/%d to %s: %w", i+1, len(p.Accs), a.Addr, err)
+		txs := make([]sent, 0, len(round))
+		for _, fp := range round {
+			sender := p.Master
+			if fp.sender >= 0 {
+				sender = p.Accs[fp.sender]
+			}
+			recv := p.Accs[fp.receiver]
+			tx := types.NewTx(&types.DynamicFeeTx{
+				ChainID:   p.ChainID,
+				Nonce:     sender.Next(0),
+				GasTipCap: tip,
+				GasFeeCap: feeCap,
+				Gas:       21000,
+				To:        &recv.Addr,
+				Value:     endow[fp.receiver],
+			})
+			signed, err := types.SignTx(tx, p.Signer, sender.Key)
+			if err != nil {
+				return fmt.Errorf("sign funding tx for %s: %w", recv.Addr, err)
+			}
+			if err := p.sendWithRetry(ctx, signed); err != nil {
+				return fmt.Errorf("send funding tx to %s: %w", recv.Addr, err)
+			}
+			txs = append(txs, sent{hash: signed.Hash(), addr: recv.Addr})
 		}
-		if err := p.waitMined(ctx, signed.Hash(), 60*time.Second); err != nil {
-			return fmt.Errorf("wait funding tx %d/%d (%s): %w", i+1, len(p.Accs), a.Addr, err)
+		var wg sync.WaitGroup
+		errCh := make(chan error, len(txs))
+		for _, s := range txs {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := p.waitMined(ctx, s.hash, 60*time.Second); err != nil {
+					errCh <- fmt.Errorf("wait funding tx to %s: %w", s.addr, err)
+				}
+			}()
 		}
+		wg.Wait()
+		close(errCh)
+		for e := range errCh {
+			if e != nil {
+				return e
+			}
+		}
+		funded += len(round)
+		log.Printf("[fund] round %d/%d mined: %d/%d accounts funded", ri+1, len(rounds), funded, len(p.Accs))
 	}
+
+	// Re-seed every account's nonce from chain: tree senders consumed nonces.
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(p.Accs))
 	for _, a := range p.Accs {
-		if err := p.seedNonce(ctx, a); err != nil {
-			return err
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := p.seedNonce(ctx, a); err != nil {
+				errCh <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for e := range errCh {
+		if e != nil {
+			return e
 		}
 	}
 	return nil
+}
+
+// sweepAmount returns how much of `bal` can be sent back to the master after
+// reserving `gasReserve` for the sweep tx itself. Returns nil if the balance
+// can't even cover the reserve (nothing worth sweeping).
+func sweepAmount(bal, gasReserve *big.Int) *big.Int {
+	amount := new(big.Int).Sub(bal, gasReserve)
+	if amount.Sign() <= 0 {
+		return nil
+	}
+	return amount
+}
+
+// Sweep returns each load account's leftover native balance to the master,
+// reserving one tx of gas per account. This recovers the funds Fund sent out:
+// the load-account keys are random and in-memory only, so anything left in them
+// is unrecoverable once the process exits. Best-effort - an account that can't
+// cover its own sweep gas, or whose send/mine fails, is skipped and logged; the
+// total amount recovered (in wei) is returned. Each account is a distinct
+// sender with a single tx, so the 1-in-flight-per-sender rule allows all sweeps
+// to run concurrently (~one block total instead of one block per account).
+func (p *Pool) Sweep(ctx context.Context) (*big.Int, error) {
+	feeCap, tip, err := p.Fees(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("suggest fees: %w", err)
+	}
+	// Max cost of one 21000-gas transfer at this feeCap. The EIP-1559 balance
+	// check requires balance >= value + gas*feeCap, so reserving exactly this
+	// lets the tx pass while sending everything else back.
+	gasReserve := new(big.Int).Mul(big.NewInt(21000), feeCap)
+
+	recovered := new(big.Int)
+	swept, skipped := 0, 0
+	var mu sync.Mutex
+	// Serializes broadcasts across the sweep goroutines: concurrent
+	// eth_sendRawTransaction can panic the node's CheckTx (see Fund). Reads,
+	// signing, and receipt waits stay fully concurrent.
+	var sendMu sync.Mutex
+	var wg sync.WaitGroup
+	for i, a := range p.Accs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			skip := func(format string, args ...any) {
+				log.Printf("[sweep] %d/%d: "+format, append([]any{i + 1, len(p.Accs)}, args...)...)
+				mu.Lock()
+				skipped++
+				mu.Unlock()
+			}
+			bal, err := p.Client.BalanceAt(ctx, a.Addr, nil)
+			if err != nil {
+				skip("balance read failed for %s: %v (skipped)", a.Addr, err)
+				return
+			}
+			amount := sweepAmount(bal, gasReserve)
+			if amount == nil {
+				mu.Lock()
+				skipped++ // dust: not enough to cover the sweep's own gas
+				mu.Unlock()
+				return
+			}
+			nonce, err := p.Client.PendingNonceAt(ctx, a.Addr)
+			if err != nil {
+				skip("nonce read failed for %s: %v (skipped)", a.Addr, err)
+				return
+			}
+			tx := types.NewTx(&types.DynamicFeeTx{
+				ChainID:   p.ChainID,
+				Nonce:     nonce,
+				GasTipCap: tip,
+				GasFeeCap: feeCap,
+				Gas:       21000, // intrinsic gas for a value transfer to an EOA (master is an EOA, same as Fund assumes)
+				To:        &p.Master.Addr,
+				Value:     amount,
+			})
+			signed, err := types.SignTx(tx, p.Signer, a.Key)
+			if err != nil {
+				skip("sign failed for %s: %v (skipped)", a.Addr, err)
+				return
+			}
+			sendMu.Lock()
+			err = p.sendWithRetry(ctx, signed)
+			sendMu.Unlock()
+			if err != nil {
+				skip("send failed for %s: %v (skipped)", a.Addr, err)
+				return
+			}
+			if err := p.waitMined(ctx, signed.Hash(), 60*time.Second); err != nil {
+				skip("not mined for %s: %v (funds may still return)", a.Addr, err)
+				return
+			}
+			mu.Lock()
+			recovered.Add(recovered, amount)
+			swept++
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	log.Printf("[sweep] recovered %s wei to master from %d/%d accounts (%d skipped)",
+		recovered, swept, len(p.Accs), skipped)
+	return recovered, nil
+}
+
+// sendWithRetry broadcasts a signed tx, retrying transient rejections with a
+// growing backoff. Retries resend the SAME signed tx, so they are idempotent -
+// a duplicate that already reached the pool comes back "already known" and
+// counts as success. This covers the node's recovered CheckTx panics (e.g. the
+// account-creation index-conflict race): the state that caused the race
+// commits within a block, after which the resend is admitted.
+func (p *Pool) sendWithRetry(ctx context.Context, tx *types.Transaction) error {
+	const attempts = 5
+	var err error
+	for i := 1; ; i++ {
+		err = p.Client.SendTransaction(ctx, tx)
+		if err == nil {
+			return nil
+		}
+		if strings.Contains(err.Error(), "already known") {
+			return nil // an earlier attempt landed in the pool
+		}
+		if i == attempts {
+			return err
+		}
+		msg := err.Error()
+		if len(msg) > 200 { // node errors can embed a full panic stack
+			msg = msg[:200] + "..."
+		}
+		log.Printf("[send] broadcast attempt %d/%d failed (%s) - retrying", i, attempts, msg)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(i) * 500 * time.Millisecond):
+		}
+	}
 }
 
 func (p *Pool) waitMined(ctx context.Context, hash common.Hash, timeout time.Duration) error {

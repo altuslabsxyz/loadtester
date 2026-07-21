@@ -53,8 +53,19 @@ type Node struct {
 type Funding struct {
 	MasterKey      string `yaml:"masterKey"`      // hex private key, with or without 0x
 	AccountsN      int    `yaml:"accountsN"`      // number of load accounts to generate
-	FundPerAccount string `yaml:"fundPerAccount"` // human amount in whole gas tokens (e.g. "1")
+	FundPerAccount string `yaml:"fundPerAccount"` // decimal whole gas tokens, e.g. "0.01" or "1" (fractional supported; ×1e18 to wei)
+	// SweepBack controls whether, at the end of a one-shot run, each load
+	// account's leftover native balance is returned to the master (minus one
+	// tx of gas). The load-account keys are random and in-memory only, so funds
+	// left in them are unrecoverable once the process exits - sweeping recovers
+	// ~all of what Fund sent out. Default (nil/omitted) is ON; set to false to
+	// leave funds stranded (e.g. for post-run inspection). No effect in
+	// continuous mode (Ctrl+C interrupts before a sweep can run).
+	SweepBack *bool `yaml:"sweepBack"`
 }
+
+// ShouldSweep reports whether end-of-run fund recovery is enabled (default on).
+func (f Funding) ShouldSweep() bool { return f.SweepBack == nil || *f.SweepBack }
 
 // Governance describes lane-registration behavior.
 type Governance struct {
@@ -82,6 +93,11 @@ type LaneLoad struct {
 type Workload struct {
 	DurationSec int                 `yaml:"durationSec"`
 	Lanes       map[string]LaneLoad `yaml:"lanes"`
+	// RecipientPoolSize controls shared-recipient contention for transfer workloads.
+	//   0 (default): one deterministic recipient per sender, for parallel-capacity tests.
+	//   1:           one shared hot recipient, reproducing the legacy contention test.
+	//   N > 1:       deterministically shard senders across N shared recipients.
+	RecipientPoolSize int `yaml:"recipientPoolSize"`
 	// AllowDestructive gates SELFDESTRUCT / heavy determinism scenarios.
 	// Defaults false (testnet-safe); must be explicitly enabled.
 	AllowDestructive bool `yaml:"allowDestructive"`
@@ -190,6 +206,9 @@ func (t *Target) validate() error {
 	}
 	if len(t.Nodes) == 0 {
 		return fmt.Errorf("at least one node is required")
+	}
+	if t.Workload.RecipientPoolSize < 0 {
+		return fmt.Errorf("workload.recipientPoolSize must be >= 0")
 	}
 	for i, n := range t.Nodes {
 		if n.JSONRPC == "" {

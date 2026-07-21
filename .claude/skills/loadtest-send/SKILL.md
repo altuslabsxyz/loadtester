@@ -21,7 +21,7 @@ loadtester start -t target.yaml -d deployment.json -o out --fail-on review
 
 ## How the load actually behaves on stable (so results make sense)
 - **1-in-flight per account, closed-loop**: each account sends one tx, waits for its receipt, then the next. Throughput scales with `accountsN`, NOT per-account inflight (the chain rejects future nonces).
-- **Funding is lockstep** → setup takes ~`accountsN` blocks before load starts. Don't mistake a slow setup for a hang; tail the log (`[setup] accounts funded`).
+- **Funding fans out as a doubling tree** → setup takes ~`log2(accountsN)` blocks before load starts (watch the `[fund] round i/N mined` log lines until `[setup] accounts funded`).
 - **unordered** is rate-limited fire-and-forget (~`targetInflight` tx/s); it won't flood/starve the ordered lanes.
 - **vip** goes only to the `role: vip` node and is skipped (logged) if there isn't one.
 - Each value/vip/unordered tx sends **1 wei**; gas is paid from the account's funded balance.
@@ -34,4 +34,4 @@ loadtester start -t target.yaml -d deployment.json -o out --fail-on review
 ## Common mistakes
 - Treating `txpool_status` as the mempool signal — it's vestigial (0) on stable; use CometRPC `num_unconfirmed_txs`.
 - Cranking `targetInflight` expecting more ordered load — raise `accountsN` instead.
-- Killing a run that looks stuck during lockstep funding — it's just slow, not hung.
+- Killing a run during setup — funding is only ~`log2(accountsN)` blocks, but token prep (mint+approve) still takes a few blocks; tail the log before assuming a hang.

@@ -32,7 +32,10 @@ nodes:
 funding:
   masterKey: "0x..."           # pre-funded key; fans out to the load accounts
   accountsN: 20                # number of load accounts to generate
-  fundPerAccount: "1"          # whole native tokens per account
+  fundPerAccount: "1"          # decimal whole native tokens per account (e.g. "0.01"); fund only what gas needs
+  # sweepBack: true            # default on: return each account's leftover to the master at end of a
+                               # one-shot run (net cost = gas only). Full accountsN x fundPerAccount is
+                               # still needed UPFRONT to float. Set false to leave funds stranded (lost).
 
 # ── Governance (how lanes get registered) ─────────────────────────────────
 governance:
@@ -62,6 +65,11 @@ governance:
 workload:
   durationSec: 0               # >0 = one-shot for N seconds; <=0 = CONTINUOUS (until Ctrl+C)
   allowDestructive: false      # gate bump/selfdestruct (keep false on a testnet)
+  # Transfer-recipient contention topology:
+  #   0/omitted = deterministic recipient per sender (capacity benchmark)
+  #   1         = one legacy hot recipient (maximum-conflict benchmark)
+  #   N > 1     = deterministically shard senders across N shared recipients
+  recipientPoolSize: 0
   lanes:
     # Relative targetInflight sets the per-account mix ratio (quantized to /10)
     # for the standard kinds. Drop a key or set targetInflight: 0 to disable it.

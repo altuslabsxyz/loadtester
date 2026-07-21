@@ -12,7 +12,7 @@ contract addresses (empty `{}` is fine for token-free workloads). `loadtester
 start` runs these phases in order:
 
 1. **connect + chainId check** — dials the load endpoint; aborts on `eth_chainId` mismatch.
-2. **fund** — master key sends `fundPerAccount` to each of `accountsN` fresh random accounts (LOCKSTEP - see 1-in-flight below).
+2. **fund** — `fundPerAccount` reaches each of `accountsN` fresh random accounts via a FAN-OUT TREE (~log2(accountsN) blocks - see 1-in-flight below).
 3. **token prep** — `PrepareAccounts` mints/approves test tokens (only if the deployment has them; skipped for token-free workloads).
 4. **lanes** — register (fast-pass/real-vote) OR read/assume (preconfigured) the lane params; build the classifier + per-lane quotas.
 5. **observe** — start 3 collectors: Lane (per-lane gas attribution), Mempool (CList depth), AppHash (per-node app_hash + stall).
@@ -40,12 +40,27 @@ future/queued lane — a gapped tx is dropped. So an account can have at most ON
 in-flight tx. Consequences:
 - The driver is **closed-loop**: send one tx → wait for its receipt → send the next.
 - **Concurrency comes from the NUMBER of accounts (`accountsN`), not depth.** To push harder, raise `accountsN`, not per-account inflight.
-- **Funding is lockstep**: the master sends one funding tx, waits for it to mine, then the next. Blasting them would get all-but-the-first dropped. (This makes funding take ~`accountsN` blocks.)
+- **Funding fans out as a tree**: one sender can still fund only one account per block (blasting from the master would get all-but-the-first dropped), so each round the master AND every already-funded account fund one new account — the funded set doubles per block. Intermediate accounts receive their own share plus everything they must forward, so the master float is unchanged. (Funding takes ~`log2(accountsN)` blocks, not ~`accountsN`; the sweep-back is likewise concurrent — distinct senders, one tx each.)
 - `unordered` txs are exempt (NonceKey=MaxUint64) and are rate-limited fire-and-forget.
 
+### Concurrent broadcasts can panic the node's CheckTx (account-creation race)
+Two `eth_sendRawTransaction` calls processed concurrently by a node can race in
+CheckTx's fee-deduction path when an account has to be created (x/auth's unique
+account-number index trips: `collections: conflict: index uniqueness constrain
+violation`, a recovered panic; the tx is rejected with the node's stack in the
+RPC error). Observed on v1.8.0-rc0 during fan-out funding. The tool therefore
+SERIALIZES its own broadcasts during funding and sweep (receipt waits stay
+parallel - a broadcast is ~ms, so rounds still mine in ~one block) and RETRIES
+transient rejections (same signed tx, idempotent; "already known" = success).
+This is a CHAIN-side fragility - if it appears during the LOAD phase (workloads
+broadcast concurrently by design), report it to the chain team rather than
+tuning the tool around it.
+
 ### Native gas-token decimals
-`fundPerAccount` is in WHOLE gas tokens; the tool multiplies by `10^18`. This is
-correct only if the chain's EVM balance is 18-decimal. **The public testnet's
+`fundPerAccount` is DECIMAL whole gas tokens (e.g. `"0.01"`, `"1"`, `"2.5"`); the
+tool multiplies by `10^18` to wei (fractions beyond 18 decimals truncate). Fund
+each account only what it needs for gas (~0.00002/tx) rather than a whole token.
+This is correct only if the chain's EVM balance is 18-decimal. **The public testnet's
 USDT0 is 18-dec** (`eth_getBalance` returns `whole × 1e18`). The local `init.sh`
 chain configures a 6-dec gas token — verify per environment. If the master-balance
 precheck aborts with "balance X < required", the decimals don't match the 18-dec
@@ -99,6 +114,9 @@ Goal 1 and Goal 3 are INCONCLUSIVE by nature — that is honest, not a failure.
 - The generator only produces value / erc20Transfer / swap / vip / unordered tx
   SHAPES; a lane whose matcher none of these hit is reported **NOT EXERCISED**
   (never silently "passed").
-- Funds sent to the random load accounts are NOT swept back → effectively spent.
+- Funds sent to the random load accounts are swept back to the master at the end
+  of a one-shot run by default (`funding.sweepBack: true`); with it off, or in
+  continuous mode (Ctrl+C interrupts first), they're stranded on in-memory keys
+  and lost. Either way the full float is needed upfront (precheck).
 - gRPC is insecure-only (no TLS); single VIP lane only; reconciliation checks
   declared⊆on-chain (extra on-chain lanes are not surfaced).

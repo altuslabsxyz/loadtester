@@ -66,7 +66,12 @@ func renderConfig(path string, t *config.Target) string {
 	fmt.Fprintf(&b, "Funding\n")
 	fmt.Fprintf(&b, "  masterKey:      %s\n", keyDesc(t.Funding.MasterKey))
 	fmt.Fprintf(&b, "  accountsN:      %d\n", t.Funding.AccountsN)
-	fmt.Fprintf(&b, "  fundPerAccount: %s\n\n", orDash(t.Funding.FundPerAccount))
+	fmt.Fprintf(&b, "  fundPerAccount: %s\n", orDash(t.Funding.FundPerAccount))
+	if t.Funding.ShouldSweep() {
+		fmt.Fprintf(&b, "  sweepBack:      on (leftover balances returned to master after the run)\n\n")
+	} else {
+		fmt.Fprintf(&b, "  sweepBack:      OFF (funds left in load accounts are unrecoverable)\n\n")
+	}
 
 	fmt.Fprintf(&b, "Governance\n")
 	fmt.Fprintf(&b, "  mode:        %s\n", t.Governance.Mode)
@@ -99,6 +104,11 @@ func renderConfig(path string, t *config.Target) string {
 		fmt.Fprintf(&b, "  mode:        one-shot (durationSec=%d)\n", t.Workload.DurationSec)
 	}
 	fmt.Fprintf(&b, "  destructive: %s\n", allowedBlocked(t.Workload.AllowDestructive))
+	if t.Workload.RecipientPoolSize == 0 {
+		fmt.Fprintf(&b, "  recipients:  per-sender (disjoint capacity mode)\n")
+	} else {
+		fmt.Fprintf(&b, "  recipients:  shared pool of %d\n", t.Workload.RecipientPoolSize)
+	}
 	fmt.Fprintf(&b, "  lanes:\n")
 	for _, k := range sortedKeys(t.Workload.Lanes) {
 		l := t.Workload.Lanes[k]

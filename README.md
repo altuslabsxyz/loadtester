@@ -137,6 +137,12 @@ CometBFT RPC, no gRPC, and no validator keys. The harness degrades to that:
    (otherwise the mint reverts and setup aborts with a clear error).
 4. `loadtester start -t target.yaml` (continuous by default). For CI, run a
    one-shot (`durationSec > 0`) with `--fail-on=fail` (or `review`).
+5. Funds recovery: by default (`funding.sweepBack: true`) each load account's
+   leftover balance is returned to the master at the end of a **one-shot** run, so
+   the net cost is only gas. The full `accountsN × fundPerAccount` must still be on
+   the master **upfront** to float the run. Set `sweepBack: false` (or use
+   continuous mode, where Ctrl+C interrupts before the sweep) to leave funds
+   stranded on the random, in-memory-only account keys — unrecoverable.
 
 What is observable on a JSON-RPC-only target:
 

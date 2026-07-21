@@ -2,6 +2,7 @@ package workload
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"math"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 
 	"github.com/stablelabs/loadtester/accounts"
@@ -48,9 +50,43 @@ func nextUnorderedTimeout() int64 {
 	return time.Now().UnixNano() + unorderedTTL.Nanoseconds() + unorderedSeq.Add(1)
 }
 
-// burnRecipient receives value/token transfers; keeps balances flowing without
-// needing a second managed account per send.
-var burnRecipient = common.HexToAddress("0x000000000000000000000000000000000000dEaD")
+// legacyHotRecipient preserves the old single-recipient workload when
+// recipientPoolSize=1. Capacity tests use per-sender recipients by default.
+var legacyHotRecipient = common.HexToAddress("0x000000000000000000000000000000000000dEaD")
+
+var (
+	perSenderRecipientDomain = []byte("stable-loadtester/per-sender-recipient/v1")
+	poolAssignmentDomain     = []byte("stable-loadtester/recipient-pool-assignment/v1")
+	poolRecipientDomain      = []byte("stable-loadtester/recipient-pool-address/v1")
+)
+
+// derivedRecipient returns a domain-separated deterministic EOA-like address.
+// Setting the high bit keeps generated addresses away from the low precompile
+// range. This is load-generator logic only; it never participates in consensus.
+func derivedRecipient(domain, input []byte) common.Address {
+	digest := crypto.Keccak256(domain, input)
+	digest[12] |= 0x80
+	return common.BytesToAddress(digest[12:])
+}
+
+// recipientFor maps a sender to the configured contention topology:
+//   - poolSize == 0: a disjoint deterministic recipient for this sender
+//   - poolSize == 1: the legacy shared hot recipient
+//   - poolSize > 1:  a deterministic shared pool of poolSize recipients
+func recipientFor(sender common.Address, poolSize int) common.Address {
+	if poolSize == 1 {
+		return legacyHotRecipient
+	}
+	if poolSize <= 0 {
+		return derivedRecipient(perSenderRecipientDomain, sender.Bytes())
+	}
+
+	assignment := crypto.Keccak256(poolAssignmentDomain, sender.Bytes())
+	bucket := binary.BigEndian.Uint64(assignment[:8]) % uint64(poolSize)
+	var bucketBytes [8]byte
+	binary.BigEndian.PutUint64(bucketBytes[:], bucket)
+	return derivedRecipient(poolRecipientDomain, bucketBytes[:])
+}
 
 // gasFor returns a per-kind gas limit. Generous to avoid out-of-gas on the
 // heavier contract calls; the chain meters actual gasUsed which the collector
@@ -139,6 +175,9 @@ type Builder struct {
 	abis         *ABIs
 	dep          *deployment.Deployment
 	expectedLane map[Kind]int32
+	// recipientPoolSize controls transfer contention. Zero is the capacity-test
+	// default: one deterministic recipient per sender.
+	recipientPoolSize int
 
 	pool0     common.Address // first uniswap pool (for swaps), zero if none
 	token0    common.Address // first test token (for erc20 transfer), zero if none
@@ -189,6 +228,10 @@ var AllKinds = []Kind{
 // the on-chain params).
 func (b *Builder) SetExpectedLane(m map[Kind]int32) { b.expectedLane = m }
 
+// SetRecipientPoolSize configures transfer-recipient contention. Configuration
+// validation rejects negative values before the builder is constructed.
+func (b *Builder) SetRecipientPoolSize(n int) { b.recipientPoolSize = n }
+
 // SetEnterpriseLane sets the on-chain lane ID encoded into Enterprise nonce
 // keys. It must match the effective chain parameters, not merely the YAML.
 func (b *Builder) SetEnterpriseLane(id int32) { b.expectedLane[KindEnterprise] = id }
@@ -230,13 +273,14 @@ func (b *Builder) NonceKey(k Kind) uint64 {
 // explicit nonce (caller owns nonce assignment) and caller-provided fees.
 func (b *Builder) build(k Kind, a *accounts.Account, nonce uint64, feeCap, tip *big.Int) (*types.Transaction, error) {
 	gas := gasFor(k)
+	recipient := recipientFor(a.Addr, b.recipientPoolSize)
 	switch k {
 	case KindValue:
-		return b.pool.SignStandard(a, nonce, &burnRecipient, big.NewInt(1), nil, gas, feeCap, tip)
+		return b.pool.SignStandard(a, nonce, &recipient, big.NewInt(1), nil, gas, feeCap, tip)
 	case KindVIP:
-		return b.pool.SignVIP(a, nonce, vipLaneID(b.expectedLane), &burnRecipient, big.NewInt(1), nil, gas, feeCap, tip)
+		return b.pool.SignVIP(a, nonce, vipLaneID(b.expectedLane), &recipient, big.NewInt(1), nil, gas, feeCap, tip)
 	case KindERC20Transfer:
-		data, err := b.abis.PackTransfer(burnRecipient, big.NewInt(1))
+		data, err := b.abis.PackTransfer(recipient, big.NewInt(1))
 		if err != nil {
 			return nil, err
 		}
@@ -266,7 +310,7 @@ func (b *Builder) build(k Kind, a *accounts.Account, nonce uint64, feeCap, tip *
 		return b.pool.SignStandard(a, nonce, &d, nil, data, gas, feeCap, tip)
 	case KindUnordered:
 		// Unordered tx: NonceKey=MaxUint64, Nonce=0, unique future timeout.
-		return b.pool.SignUnordered(a, &burnRecipient, big.NewInt(1), nil, gas, feeCap, tip, nextUnorderedTimeout())
+		return b.pool.SignUnordered(a, &recipient, big.NewInt(1), nil, gas, feeCap, tip, nextUnorderedTimeout())
 	default:
 		return nil, fmt.Errorf("unknown workload kind %q", k)
 	}

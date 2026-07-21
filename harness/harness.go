@@ -85,6 +85,15 @@ func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string)
 		log.Printf("[setup] lane plan: built-in preset")
 	}
 	builder := workload.NewBuilder(pool, abis, dep, plan.ExpectedLane)
+	builder.SetRecipientPoolSize(tgt.Workload.RecipientPoolSize)
+	switch n := tgt.Workload.RecipientPoolSize; {
+	case n == 0:
+		log.Printf("[setup] transfer recipients: one deterministic recipient per sender (capacity mode)")
+	case n == 1:
+		log.Printf("[setup] transfer recipients: one shared hot recipient (contention mode)")
+	default:
+		log.Printf("[setup] transfer recipients: %d deterministic shared recipients", n)
+	}
 	if err := builder.PrepareAccounts(ctx); err != nil {
 		return fmt.Errorf("prepare token balances: %w", err)
 	}
@@ -348,6 +357,29 @@ func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string)
 	stopObs()
 	time.Sleep(500 * time.Millisecond) // let collectors flush final samples
 	writeReport("final")
+
+	// Recover funds: return each load account's leftover balance to the master.
+	// Runs AFTER the report is written and collectors are stopped, so the sweep
+	// txs never affect the mempool-drain (Goal 2) measurement or the verdict. The
+	// load-account keys are random/in-memory, so this is the only chance to get
+	// the funds back before they're stranded forever. Best-effort: sweep failures
+	// are logged but never fail the run.
+	if tgt.Funding.ShouldSweep() {
+		log.Printf("[sweep] returning leftover account balances to master")
+		// Detached context: if the operator Ctrl+C'd this one-shot, the run ctx is
+		// already cancelled, but we still want to recover funds before the random,
+		// in-memory-only account keys are gone. Bound it so a wedged endpoint can't
+		// hang shutdown forever. Sweeps run concurrently (distinct senders, one tx
+		// each, ~one block total), so a flat cap suffices regardless of accountsN.
+		sweepCap := 5 * time.Minute
+		sweepCtx, cancel := context.WithTimeout(context.Background(), sweepCap)
+		if _, err := pool.Sweep(sweepCtx); err != nil {
+			log.Printf("[sweep] WARNING: sweep-back failed: %v (funds left in accounts are unrecoverable)", err)
+		}
+		cancel()
+	} else {
+		log.Printf("[sweep] disabled (funding.sweepBack=false); funds left in load accounts are unrecoverable")
+	}
 
 	// CI gate: exit non-zero when the overall verdict meets the --fail-on
 	// threshold. Continuous mode returns earlier (Goal 2 is LIVE), so this only

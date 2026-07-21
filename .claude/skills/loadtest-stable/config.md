@@ -18,7 +18,7 @@ nodes:                        # >=1; jsonrpc required. cometRPC/grpc optional.
 funding:
   masterKey: "0x<hex>"        # funded key; signs only the funding txs (preconfigured mode)
   accountsN: <int>            # number of load accounts (= concurrency; each is 1-in-flight)
-  fundPerAccount: "<int>"     # WHOLE gas tokens per account (integer string; tool multiplies by 1e18)
+  fundPerAccount: "0.01"      # DECIMAL whole gas tokens per account (fractional ok; ×1e18 to wei). Fund only what gas needs.
 governance:
   mode: preconfigured         # testnet: lanes already registered, declared below. (fast-pass/real-vote = local only)
   proposerKey: ""             # fast-pass/real-vote only
@@ -78,11 +78,17 @@ Set that product ≤ your budget. **Units:** whole tokens. `fundPerAccount: "1"`
 fundPerAccount: "1"` ⇒ master spends 50 whole tokens. The master-balance precheck
 aborts (no spend) if it can't cover `product + gas`.
 
-**Funds are NOT recovered**: each load account is a fresh random key; whatever is
-funded to it is effectively spent (gas is tiny, the rest is stranded). So fund
-modestly — accounts only need enough for their gas. More `accountsN` = more load
-(and slower lockstep funding); larger `fundPerAccount` = more waste. Prefer many
-accounts × small fund (e.g. `50 × 1`) over few × large.
+**Funds are recovered by default** (`funding.sweepBack: true`): at the end of a
+one-shot run each load account's leftover balance is returned to the master
+(minus one tx of gas), so the *net* cost is only gas. BUT the master must still
+hold the full `accountsN × fundPerAccount` **upfront to float** during the run —
+the precheck aborts otherwise — so the balance caps `accountsN` even though it's
+returned afterward. With `sweepBack: false` (or in continuous mode, where Ctrl+C
+interrupts before the sweep) each account's fund is stranded on a random,
+in-memory-only key and lost. More `accountsN` = more load (funding fans out as
+a doubling tree, ~`log2(accountsN)` blocks, and the sweep runs concurrently, so
+account count barely affects setup time). Prefer many accounts × small fund
+(e.g. `50 × 1`).
 
 ## Procedure (preconfigured testnet)
 
