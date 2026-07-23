@@ -6,10 +6,18 @@ package accounts
 import (
 	"context"
 	"crypto/ecdsa"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math"
 	"math/big"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +26,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/holiman/uint256"
 
 	stabletypes "github.com/stablelabs/stable/x/stable/types"
@@ -31,6 +40,7 @@ type Account struct {
 	mu        sync.Mutex
 	nonces    map[uint64]uint64 // nonceKey -> next sequence to assign
 	confirmed map[uint64]uint64 // nonceKey -> on-chain confirmed (latest) nonce
+	locked    map[uint64]bool   // nonceKey -> exclusive signer slot held
 }
 
 // Next returns and increments the next sequence for the given nonce key.
@@ -59,6 +69,33 @@ func (a *Account) Commit(nonceKey uint64) {
 	a.nonces[nonceKey]++
 }
 
+// TryAcquire reserves the account/nonce-key pair for an exclusive caller.
+func (a *Account) TryAcquire(nonceKey uint64) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.locked[nonceKey] {
+		return false
+	}
+	a.locked[nonceKey] = true
+	return true
+}
+
+// Release clears a previous TryAcquire reservation for the account/nonce-key.
+func (a *Account) Release(nonceKey uint64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.locked, nonceKey)
+}
+
+// HasBase reports whether a nonce base has been seeded for the key (via
+// SetBase). Zero is a valid nonce, so presence - not value - is the signal.
+func (a *Account) HasBase(nonceKey uint64) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	_, ok := a.confirmed[nonceKey]
+	return ok
+}
+
 // SetBase seeds the next sequence for a nonce key (used for the standard key 0
 // after reading the on-chain pending nonce).
 func (a *Account) SetBase(nonceKey, seq uint64) {
@@ -66,26 +103,6 @@ func (a *Account) SetBase(nonceKey, seq uint64) {
 	defer a.mu.Unlock()
 	a.nonces[nonceKey] = seq
 	a.confirmed[nonceKey] = seq
-}
-
-// SetConfirmed records the latest on-chain confirmed nonce for a key.
-func (a *Account) SetConfirmed(nonceKey, seq uint64) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.confirmed[nonceKey] = seq
-}
-
-// Inflight returns assigned-minus-confirmed for a key (the open-loop window).
-// Clamped at 0: confirmed can momentarily exceed the local assign pointer (poll
-// races, external txs, re-seed), and an unsigned underflow would otherwise wrap
-// to a huge value and silently disable the window.
-func (a *Account) Inflight(nonceKey uint64) int {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.confirmed[nonceKey] >= a.nonces[nonceKey] {
-		return 0
-	}
-	return int(a.nonces[nonceKey] - a.confirmed[nonceKey])
 }
 
 // Pool is the connected account pool bound to a chain.
@@ -96,6 +113,22 @@ type Pool struct {
 	Master  *Account
 	Accs    []*Account
 }
+
+// PoolOptions controls optional account-pool persistence. Empty options keep
+// the legacy behavior: crypto-random ephemeral load accounts.
+type PoolOptions struct {
+	AccountSeed  string
+	AccountsFile string
+}
+
+const (
+	minAccountSeedBytes = 32
+	accountDeriveDomain = "loadtester/account-derivation/v1"
+	accountFingerDomain = "loadtester/account-fingerprint/v1"
+	manifestVersion     = 1
+	fundingWorkers      = 32
+	sweepWorkers        = 32
+)
 
 // parseKey accepts a hex private key with or without 0x.
 func parseKey(hexKey string) (*ecdsa.PrivateKey, error) {
@@ -108,14 +141,62 @@ func newAccount(key *ecdsa.PrivateKey) *Account {
 		Addr:      crypto.PubkeyToAddress(key.PublicKey),
 		nonces:    make(map[uint64]uint64),
 		confirmed: make(map[uint64]uint64),
+		locked:    make(map[uint64]bool),
 	}
+}
+
+// NewAccount wraps a private key as a load Account with empty nonce state.
+// For offline flows (tests, tooling); networked pools come from NewPool.
+func NewAccount(key *ecdsa.PrivateKey) *Account { return newAccount(key) }
+
+// sharedEVMHTTPClient is reused across every EVM JSON-RPC dial so the many
+// bounded sender workers REUSE a small pool of keep-alive connections
+// instead of opening (and tearing down) a fresh TCP+TLS connection per call.
+//
+// Go's default HTTP transport keeps only MaxIdleConnsPerHost=2 connections idle,
+// so under high accountsN every concurrent JSON-RPC call beyond the second
+// opened a brand-new connection and closed it right after completing. That
+// connection churn - thousands of short-lived connections per second - piles up
+// TIME_WAIT sockets and netfilter conntrack entries on the *target* node and
+// forces a full TLS handshake per call, saturating CPU. Once conntrack fills the
+// kernel drops new packets (SSH included), which is what made the fullnode host
+// unreachable. Raising the idle-conn ceiling lets connections be reused, so the
+// steady-state connection count settles at ~the number of concurrent senders and
+// churn collapses to near zero. MaxConnsPerHost is intentionally left unset
+// (0/unlimited) so this change only affects connection REUSE, not throughput.
+var sharedEVMHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          2048,
+		MaxIdleConnsPerHost:   2048, // default is 2 - the root cause of the connection churn
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	},
+}
+
+// dialEVM dials an EVM JSON-RPC endpoint. For http(s) endpoints it routes the
+// RPC client through the shared connection-pooling HTTP client above; other
+// schemes (ws/wss/ipc) are not connection-per-call and fall back to the default
+// dialer.
+func dialEVM(ctx context.Context, rawurl string) (*ethclient.Client, error) {
+	if u, err := url.Parse(rawurl); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
+		rc, err := rpc.DialOptions(ctx, rawurl, rpc.WithHTTPClient(sharedEVMHTTPClient))
+		if err != nil {
+			return nil, err
+		}
+		return ethclient.NewClient(rc), nil
+	}
+	return ethclient.DialContext(ctx, rawurl)
 }
 
 // Connect dials the JSON-RPC endpoint and verifies the chain id matches the
 // expected value. A mismatch aborts: signing with the wrong eip155 id would get
 // every tx rejected.
 func Connect(ctx context.Context, jsonrpc string, expectedChainID uint64) (*ethclient.Client, *big.Int, error) {
-	c, err := ethclient.DialContext(ctx, jsonrpc)
+	c, err := dialEVM(ctx, jsonrpc)
 	if err != nil {
 		return nil, nil, fmt.Errorf("dial %s: %w", jsonrpc, err)
 	}
@@ -131,6 +212,13 @@ func Connect(ctx context.Context, jsonrpc string, expectedChainID uint64) (*ethc
 
 // NewPool connects, loads the master key, and generates n load accounts.
 func NewPool(ctx context.Context, jsonrpc, masterKeyHex string, n int, expectedChainID uint64) (*Pool, error) {
+	return NewPoolWithOptions(ctx, jsonrpc, masterKeyHex, n, expectedChainID, PoolOptions{})
+}
+
+// NewPoolWithOptions connects, loads the master key, and creates n load
+// accounts. With AccountSeed set, load keys are deterministically derived from
+// a versioned domain-separated hash; otherwise they are crypto-random.
+func NewPoolWithOptions(ctx context.Context, jsonrpc, masterKeyHex string, n int, expectedChainID uint64, opts PoolOptions) (*Pool, error) {
 	c, chainID, err := Connect(ctx, jsonrpc, expectedChainID)
 	if err != nil {
 		return nil, err
@@ -146,18 +234,160 @@ func NewPool(ctx context.Context, jsonrpc, masterKeyHex string, n int, expectedC
 		Master:  newAccount(mk),
 		Accs:    make([]*Account, 0, n),
 	}
+	seed, err := parseAccountSeed(opts.AccountSeed)
+	if err != nil {
+		return nil, err
+	}
+	if opts.AccountsFile != "" && len(seed) == 0 {
+		return nil, fmt.Errorf("accounts file requires account seed")
+	}
 	for i := 0; i < n; i++ {
-		k, err := crypto.GenerateKey()
-		if err != nil {
-			return nil, fmt.Errorf("generate account %d: %w", i, err)
+		var k *ecdsa.PrivateKey
+		if len(seed) > 0 {
+			k, err = deriveAccountKey(seed, uint64(i))
+			if err != nil {
+				return nil, fmt.Errorf("derive account %d: %w", i, err)
+			}
+		} else {
+			k, err = crypto.GenerateKey()
+			if err != nil {
+				return nil, fmt.Errorf("generate account %d: %w", i, err)
+			}
 		}
 		p.Accs = append(p.Accs, newAccount(k))
+	}
+	if opts.AccountsFile != "" {
+		if err := WriteAccountsManifest(opts.AccountsFile, seed, p.Accs); err != nil {
+			return nil, err
+		}
 	}
 	// Seed the master's standard nonce from chain.
 	if err := p.seedNonce(ctx, p.Master); err != nil {
 		return nil, err
 	}
 	return p, nil
+}
+
+func parseAccountSeed(seedHex string) ([]byte, error) {
+	seedHex = strings.TrimPrefix(strings.TrimSpace(seedHex), "0x")
+	if seedHex == "" {
+		return nil, nil
+	}
+	seed, err := hex.DecodeString(seedHex)
+	if err != nil {
+		return nil, fmt.Errorf("account seed must be hex: %w", err)
+	}
+	if len(seed) < minAccountSeedBytes {
+		return nil, fmt.Errorf("account seed must be at least %d bytes", minAccountSeedBytes)
+	}
+	return seed, nil
+}
+
+func deriveAccountKey(seed []byte, index uint64) (*ecdsa.PrivateKey, error) {
+	var idx [8]byte
+	var retry [8]byte
+	binary.BigEndian.PutUint64(idx[:], index)
+	for r := uint64(0); r < math.MaxUint64; r++ {
+		binary.BigEndian.PutUint64(retry[:], r)
+		d := crypto.Keccak256([]byte(accountDeriveDomain), seed, idx[:], retry[:])
+		k, err := crypto.ToECDSA(d)
+		if err == nil {
+			return k, nil
+		}
+	}
+	return nil, fmt.Errorf("no valid secp256k1 scalar for account index %d", index)
+}
+
+// AccountSeedFingerprint returns a public, non-secret identifier for a seed.
+func AccountSeedFingerprint(seedHex string) (string, error) {
+	seed, err := parseAccountSeed(seedHex)
+	if err != nil {
+		return "", err
+	}
+	return accountSeedFingerprint(seed), nil
+}
+
+func accountSeedFingerprint(seed []byte) string {
+	sum := crypto.Keccak256([]byte(accountFingerDomain), seed)
+	return "0x" + hex.EncodeToString(sum[:16])
+}
+
+type accountsManifest struct {
+	Version         int                     `json:"version"`
+	SeedFingerprint string                  `json:"seedFingerprint"`
+	Accounts        []accountsManifestEntry `json:"accounts"`
+}
+
+type accountsManifestEntry struct {
+	Index   int    `json:"index"`
+	Address string `json:"address"`
+}
+
+// WriteAccountsManifest atomically writes an address-only manifest. It never
+// persists seeds or private scalars.
+func WriteAccountsManifest(path string, seed []byte, accs []*Account) error {
+	if len(seed) < minAccountSeedBytes {
+		return fmt.Errorf("account seed must be at least %d bytes", minAccountSeedBytes)
+	}
+	m := accountsManifest{
+		Version:         manifestVersion,
+		SeedFingerprint: accountSeedFingerprint(seed),
+		Accounts:        make([]accountsManifestEntry, 0, len(accs)),
+	}
+	for i, a := range accs {
+		m.Accounts = append(m.Accounts, accountsManifestEntry{Index: i, Address: a.Addr.Hex()})
+	}
+	raw, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal accounts manifest: %w", err)
+	}
+	raw = append(raw, '\n')
+	if err := writeFileAtomic(path, raw, 0o644); err != nil {
+		return fmt.Errorf("write accounts manifest %s: %w", path, err)
+	}
+	return nil
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	cleanup = false
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }
 
 func (p *Pool) seedNonce(ctx context.Context, a *Account) error {
@@ -246,26 +476,157 @@ func fundSchedule(n int) [][]fundPair {
 	return rounds
 }
 
-// fundEndowments computes how much each account must RECEIVE: its own
-// perAccount amount plus, for every account it later funds, that child's
-// endowment and one tx of gas. Receivers always have a higher index than their
-// sender and only send in later rounds, so walking rounds in reverse resolves
-// children before their parents. Total master outflow stays exactly
-// n*(perAccount+gasPerTx) - the same float lockstep funding needed.
-func fundEndowments(rounds [][]fundPair, n int, perAccount, gasPerTx *big.Int) []*big.Int {
+// fundEndowments computes how much each account must RECEIVE from its parent:
+// enough to finish with perAccount balance after paying descendant endowments
+// and one gas charge for each non-zero child funding tx. Existing balances are
+// credited exactly, so already-funded seeded pools produce zero transfers.
+func fundEndowments(rounds [][]fundPair, balances []*big.Int, perAccount, gasPerTx *big.Int) []*big.Int {
+	n := len(balances)
+	required := make([]*big.Int, n)
 	endow := make([]*big.Int, n)
 	for i := range endow {
-		endow[i] = new(big.Int).Set(perAccount)
+		required[i] = new(big.Int).Set(perAccount)
+		endow[i] = new(big.Int)
 	}
 	for r := len(rounds) - 1; r >= 0; r-- {
 		for _, fp := range rounds[r] {
-			if fp.sender >= 0 {
-				endow[fp.sender].Add(endow[fp.sender], endow[fp.receiver])
-				endow[fp.sender].Add(endow[fp.sender], gasPerTx)
+			need := new(big.Int).Sub(required[fp.receiver], balances[fp.receiver])
+			if need.Sign() > 0 {
+				endow[fp.receiver] = need
+			}
+			if fp.sender >= 0 && endow[fp.receiver].Sign() > 0 {
+				required[fp.sender].Add(required[fp.sender], endow[fp.receiver])
+				required[fp.sender].Add(required[fp.sender], gasPerTx)
 			}
 		}
 	}
 	return endow
+}
+
+func rootFundingNeed(rounds [][]fundPair, endow []*big.Int, gasPerTx *big.Int) *big.Int {
+	need := new(big.Int)
+	for _, round := range rounds {
+		for _, fp := range round {
+			if fp.sender != -1 || endow[fp.receiver].Sign() == 0 {
+				continue
+			}
+			need.Add(need, endow[fp.receiver])
+			need.Add(need, gasPerTx)
+		}
+	}
+	return need
+}
+
+func boundedWorkers(total, limit int) int {
+	if total <= 0 {
+		return 0
+	}
+	if limit <= 0 {
+		return 1
+	}
+	if limit > total {
+		return total
+	}
+	return limit
+}
+
+type accountChainState struct {
+	balance *big.Int
+	nonce   uint64
+}
+
+func (p *Pool) loadAccountStates(ctx context.Context, workers int) ([]accountChainState, error) {
+	workers = boundedWorkers(len(p.Accs), workers)
+	if workers == 0 {
+		return nil, nil
+	}
+	states := make([]accountChainState, len(p.Accs))
+	jobs := make(chan int)
+	errCh := make(chan error, len(p.Accs))
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				a := p.Accs[i]
+				bal, err := p.Client.BalanceAt(ctx, a.Addr, nil)
+				if err != nil {
+					errCh <- fmt.Errorf("read balance for %s: %w", a.Addr, err)
+					continue
+				}
+				nonce, err := p.Client.PendingNonceAt(ctx, a.Addr)
+				if err != nil {
+					errCh <- fmt.Errorf("pending nonce for %s: %w", a.Addr, err)
+					continue
+				}
+				a.SetBase(0, nonce)
+				states[i] = accountChainState{balance: bal, nonce: nonce}
+			}
+		}()
+	}
+	for i := range p.Accs {
+		select {
+		case jobs <- i:
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			return nil, ctx.Err()
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			return nil, err
+		}
+	}
+	return states, nil
+}
+
+type sentFundingTx struct {
+	hash common.Hash
+	addr common.Address
+}
+
+func (p *Pool) waitFundingReceipts(ctx context.Context, txs []sentFundingTx, timeout time.Duration, workers int) error {
+	workers = boundedWorkers(len(txs), workers)
+	if workers == 0 {
+		return nil
+	}
+	jobs := make(chan sentFundingTx)
+	errCh := make(chan error, len(txs))
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for s := range jobs {
+				if err := p.waitMined(ctx, s.hash, timeout); err != nil {
+					errCh <- fmt.Errorf("wait funding tx to %s: %w", s.addr, err)
+				}
+			}
+		}()
+	}
+	for _, tx := range txs {
+		select {
+		case jobs <- tx:
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			return ctx.Err()
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	close(errCh)
+	for e := range errCh {
+		if e != nil {
+			return e
+		}
+	}
+	return nil
 }
 
 // Fund distributes `amount` (decimal whole gas tokens, e.g. "0.01") to every
@@ -285,21 +646,33 @@ func (p *Pool) Fund(ctx context.Context, amountWholeTokens string) error {
 		return fmt.Errorf("suggest fees: %w", err)
 	}
 
+	if err := p.seedNonce(ctx, p.Master); err != nil {
+		return err
+	}
+	states, err := p.loadAccountStates(ctx, fundingWorkers)
+	if err != nil {
+		return err
+	}
+	balances := make([]*big.Int, len(states))
+	for i, st := range states {
+		balances[i] = st.balance
+	}
+
 	// Master-balance precheck: on a public testnet a faucet-limited master that
-	// can't cover N transfers + gas would otherwise fund an arbitrary prefix of
-	// accounts and then fail mid-stream (or time out waiting), leaving the rest
-	// unfunded. Fail fast with a clear, actionable message instead.
-	n := int64(len(p.Accs))
+	// can't cover all root transfers plus gas would otherwise fund an arbitrary
+	// prefix of accounts and then fail mid-stream (or time out waiting), leaving
+	// the rest unfunded. Fail fast with a clear, actionable message instead.
 	bal, err := p.Client.BalanceAt(ctx, p.Master.Addr, nil)
 	if err != nil {
 		return fmt.Errorf("read master balance: %w", err)
 	}
-	need := new(big.Int).Mul(wei, big.NewInt(n))
 	gasPerTx := new(big.Int).Mul(big.NewInt(21000), feeCap)
-	need.Add(need, new(big.Int).Mul(gasPerTx, big.NewInt(n)))
+	rounds := fundSchedule(len(p.Accs))
+	endow := fundEndowments(rounds, balances, wei, gasPerTx)
+	need := rootFundingNeed(rounds, endow, gasPerTx)
 	if bal.Cmp(need) < 0 {
-		return fmt.Errorf("master %s balance %s wei < required ~%s wei (%d accounts x %s wei + gas); "+
-			"fund the master or lower funding.accountsN / fundPerAccount", p.Master.Addr.Hex(), bal, need, n, wei)
+		return fmt.Errorf("master %s balance %s wei < required %s wei for root funding transfers; "+
+			"fund the master or lower funding.accountsN / fundPerAccount", p.Master.Addr.Hex(), bal, need)
 	}
 
 	// Fan-out funding: within a round every tx has a DISTINCT sender, so the
@@ -314,16 +687,13 @@ func (p *Pool) Fund(ctx context.Context, amountWholeTokens string) error {
 	// path (x/auth "index uniqueness constrain violation", recovered panic, tx
 	// rejected). A broadcast is ~milliseconds, so serializing them costs almost
 	// nothing; the round still mines in ~one block.
-	rounds := fundSchedule(len(p.Accs))
-	endow := fundEndowments(rounds, len(p.Accs), wei, gasPerTx)
 	funded := 0
 	for ri, round := range rounds {
-		type sent struct {
-			hash common.Hash
-			addr common.Address
-		}
-		txs := make([]sent, 0, len(round))
+		txs := make([]sentFundingTx, 0, len(round))
 		for _, fp := range round {
+			if endow[fp.receiver].Sign() == 0 {
+				continue
+			}
 			sender := p.Master
 			if fp.sender >= 0 {
 				sender = p.Accs[fp.sender]
@@ -345,48 +715,18 @@ func (p *Pool) Fund(ctx context.Context, amountWholeTokens string) error {
 			if err := p.sendWithRetry(ctx, signed); err != nil {
 				return fmt.Errorf("send funding tx to %s: %w", recv.Addr, err)
 			}
-			txs = append(txs, sent{hash: signed.Hash(), addr: recv.Addr})
+			txs = append(txs, sentFundingTx{hash: signed.Hash(), addr: recv.Addr})
 		}
-		var wg sync.WaitGroup
-		errCh := make(chan error, len(txs))
-		for _, s := range txs {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				if err := p.waitMined(ctx, s.hash, 60*time.Second); err != nil {
-					errCh <- fmt.Errorf("wait funding tx to %s: %w", s.addr, err)
-				}
-			}()
+		if err := p.waitFundingReceipts(ctx, txs, 60*time.Second, fundingWorkers); err != nil {
+			return err
 		}
-		wg.Wait()
-		close(errCh)
-		for e := range errCh {
-			if e != nil {
-				return e
-			}
-		}
-		funded += len(round)
-		log.Printf("[fund] round %d/%d mined: %d/%d accounts funded", ri+1, len(rounds), funded, len(p.Accs))
+		funded += len(txs)
+		log.Printf("[fund] round %d/%d mined: %d top-up txs sent (%d/%d total)", ri+1, len(rounds), len(txs), funded, len(p.Accs))
 	}
 
 	// Re-seed every account's nonce from chain: tree senders consumed nonces.
-	var wg sync.WaitGroup
-	errCh := make(chan error, len(p.Accs))
-	for _, a := range p.Accs {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := p.seedNonce(ctx, a); err != nil {
-				errCh <- err
-			}
-		}()
-	}
-	wg.Wait()
-	close(errCh)
-	for e := range errCh {
-		if e != nil {
-			return e
-		}
+	if _, err := p.loadAccountStates(ctx, fundingWorkers); err != nil {
+		return err
 	}
 	return nil
 }
@@ -407,9 +747,8 @@ func sweepAmount(bal, gasReserve *big.Int) *big.Int {
 // the load-account keys are random and in-memory only, so anything left in them
 // is unrecoverable once the process exits. Best-effort - an account that can't
 // cover its own sweep gas, or whose send/mine fails, is skipped and logged; the
-// total amount recovered (in wei) is returned. Each account is a distinct
-// sender with a single tx, so the 1-in-flight-per-sender rule allows all sweeps
-// to run concurrently (~one block total instead of one block per account).
+// total amount recovered (in wei) is returned. A fixed-size worker pool bounds
+// balance/receipt RPC concurrency even when the reusable account pool is large.
 func (p *Pool) Sweep(ctx context.Context) (*big.Int, error) {
 	feeCap, tip, err := p.Fees(ctx)
 	if err != nil {
@@ -427,65 +766,74 @@ func (p *Pool) Sweep(ctx context.Context) (*big.Int, error) {
 	// eth_sendRawTransaction can panic the node's CheckTx (see Fund). Reads,
 	// signing, and receipt waits stay fully concurrent.
 	var sendMu sync.Mutex
+	jobs := make(chan int)
 	var wg sync.WaitGroup
-	for i, a := range p.Accs {
+	workers := boundedWorkers(len(p.Accs), sweepWorkers)
+	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			skip := func(format string, args ...any) {
-				log.Printf("[sweep] %d/%d: "+format, append([]any{i + 1, len(p.Accs)}, args...)...)
+			for i := range jobs {
+				a := p.Accs[i]
+				skip := func(format string, args ...any) {
+					log.Printf("[sweep] %d/%d: "+format, append([]any{i + 1, len(p.Accs)}, args...)...)
+					mu.Lock()
+					skipped++
+					mu.Unlock()
+				}
+				bal, err := p.Client.BalanceAt(ctx, a.Addr, nil)
+				if err != nil {
+					skip("balance read failed for %s: %v (skipped)", a.Addr, err)
+					continue
+				}
+				amount := sweepAmount(bal, gasReserve)
+				if amount == nil {
+					mu.Lock()
+					skipped++ // dust: not enough to cover the sweep's own gas
+					mu.Unlock()
+					continue
+				}
+				nonce, err := p.Client.PendingNonceAt(ctx, a.Addr)
+				if err != nil {
+					skip("nonce read failed for %s: %v (skipped)", a.Addr, err)
+					continue
+				}
+				tx := types.NewTx(&types.DynamicFeeTx{
+					ChainID:   p.ChainID,
+					Nonce:     nonce,
+					GasTipCap: tip,
+					GasFeeCap: feeCap,
+					Gas:       21000, // intrinsic gas for a value transfer to an EOA (master is an EOA, same as Fund assumes)
+					To:        &p.Master.Addr,
+					Value:     amount,
+				})
+				signed, err := types.SignTx(tx, p.Signer, a.Key)
+				if err != nil {
+					skip("sign failed for %s: %v (skipped)", a.Addr, err)
+					continue
+				}
+				sendMu.Lock()
+				err = p.sendWithRetry(ctx, signed)
+				sendMu.Unlock()
+				if err != nil {
+					skip("send failed for %s: %v (skipped)", a.Addr, err)
+					continue
+				}
+				if err := p.waitMined(ctx, signed.Hash(), 60*time.Second); err != nil {
+					skip("not mined for %s: %v (funds may still return)", a.Addr, err)
+					continue
+				}
 				mu.Lock()
-				skipped++
+				recovered.Add(recovered, amount)
+				swept++
 				mu.Unlock()
 			}
-			bal, err := p.Client.BalanceAt(ctx, a.Addr, nil)
-			if err != nil {
-				skip("balance read failed for %s: %v (skipped)", a.Addr, err)
-				return
-			}
-			amount := sweepAmount(bal, gasReserve)
-			if amount == nil {
-				mu.Lock()
-				skipped++ // dust: not enough to cover the sweep's own gas
-				mu.Unlock()
-				return
-			}
-			nonce, err := p.Client.PendingNonceAt(ctx, a.Addr)
-			if err != nil {
-				skip("nonce read failed for %s: %v (skipped)", a.Addr, err)
-				return
-			}
-			tx := types.NewTx(&types.DynamicFeeTx{
-				ChainID:   p.ChainID,
-				Nonce:     nonce,
-				GasTipCap: tip,
-				GasFeeCap: feeCap,
-				Gas:       21000, // intrinsic gas for a value transfer to an EOA (master is an EOA, same as Fund assumes)
-				To:        &p.Master.Addr,
-				Value:     amount,
-			})
-			signed, err := types.SignTx(tx, p.Signer, a.Key)
-			if err != nil {
-				skip("sign failed for %s: %v (skipped)", a.Addr, err)
-				return
-			}
-			sendMu.Lock()
-			err = p.sendWithRetry(ctx, signed)
-			sendMu.Unlock()
-			if err != nil {
-				skip("send failed for %s: %v (skipped)", a.Addr, err)
-				return
-			}
-			if err := p.waitMined(ctx, signed.Hash(), 60*time.Second); err != nil {
-				skip("not mined for %s: %v (funds may still return)", a.Addr, err)
-				return
-			}
-			mu.Lock()
-			recovered.Add(recovered, amount)
-			swept++
-			mu.Unlock()
 		}()
 	}
+	for i := range p.Accs {
+		jobs <- i
+	}
+	close(jobs)
 	wg.Wait()
 	log.Printf("[sweep] recovered %s wei to master from %d/%d accounts (%d skipped)",
 		recovered, swept, len(p.Accs), skipped)

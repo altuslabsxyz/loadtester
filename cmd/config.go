@@ -8,6 +8,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/spf13/cobra"
 
+	"github.com/stablelabs/loadtester/accounts"
 	"github.com/stablelabs/loadtester/config"
 )
 
@@ -67,8 +68,22 @@ func renderConfig(path string, t *config.Target) string {
 	fmt.Fprintf(&b, "  masterKey:      %s\n", keyDesc(t.Funding.MasterKey))
 	fmt.Fprintf(&b, "  accountsN:      %d\n", t.Funding.AccountsN)
 	fmt.Fprintf(&b, "  fundPerAccount: %s\n", orDash(t.Funding.FundPerAccount))
+	if strings.TrimSpace(t.Funding.AccountSeed) == "" {
+		fmt.Fprintf(&b, "  pool mode:      random ephemeral\n")
+		fmt.Fprintf(&b, "  accountSeed:    -\n")
+	} else {
+		fp, err := accounts.AccountSeedFingerprint(t.Funding.AccountSeed)
+		if err != nil {
+			fp = "(invalid)"
+		}
+		fmt.Fprintf(&b, "  pool mode:      deterministic seeded\n")
+		fmt.Fprintf(&b, "  accountSeed:    fingerprint=%s\n", fp)
+	}
+	fmt.Fprintf(&b, "  accountsFile:   %s\n", orDash(t.Funding.AccountsFile))
 	if t.Funding.ShouldSweep() {
 		fmt.Fprintf(&b, "  sweepBack:      on (leftover balances returned to master after the run)\n\n")
+	} else if strings.TrimSpace(t.Funding.AccountSeed) != "" {
+		fmt.Fprintf(&b, "  sweepBack:      OFF (funds retained in deterministic load accounts for reuse)\n\n")
 	} else {
 		fmt.Fprintf(&b, "  sweepBack:      OFF (funds left in load accounts are unrecoverable)\n\n")
 	}
@@ -104,6 +119,8 @@ func renderConfig(path string, t *config.Target) string {
 		fmt.Fprintf(&b, "  mode:        one-shot (durationSec=%d)\n", t.Workload.DurationSec)
 	}
 	fmt.Fprintf(&b, "  destructive: %s\n", allowedBlocked(t.Workload.AllowDestructive))
+	fmt.Fprintf(&b, "  workers:     %d\n", t.Workload.Workers)
+	fmt.Fprintf(&b, "  targetTPS:   %d\n", t.Workload.TargetTPS)
 	if t.Workload.RecipientPoolSize == 0 {
 		fmt.Fprintf(&b, "  recipients:  per-sender (disjoint capacity mode)\n")
 	} else {

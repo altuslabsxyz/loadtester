@@ -16,6 +16,11 @@ Turn a finished run into an honest verdict and report. Assumes the run is done
 - `paramsVerified` (false ⇒ lanes ASSUMED, no gRPC), `lanesReconciled` (false ⇒ declared lanes ≠ on-chain).
 - `continuous` (true ⇒ a LIVE snapshot, NOT a verdict — rerun one-shot to judge).
 - Markdown lane table: lanes flagged **NOT EXERCISED** were declared/registered but got no traffic → NOT verified; never report them as passed.
+- `outcomes` (send-engine counters) — how the sender interacted with chain admission:
+  - `already-known` / `nonce-conflict-parked` ≈ 0 on a healthy run; non-zero at scale means duplicate-nonce traffic (engine bug or a prior run's residue self-healing at start — small counts at startup are fine).
+  - `mempool-full-backoff` > 0 = the CHAIN pushed back (raise node `mempool.size` or lower `targetTPS`); this caps achievable tx/block and is a chain-config finding, not a loadtester bug.
+  - `fee-bumped-replacement` / `hard-reset` = txs sat unmined past TTL (evicted or stuck) — correlate with Goal 2.
+  - `sentTotal` ≪ `targetTPS × durationSec` with low `starved` in the run log ⇒ admission was the bottleneck; with HIGH starved ⇒ inclusion rate was (add accounts or accept the chain's plateau).
 
 ## Verdict meaning (report honestly)
 | verdict | means |

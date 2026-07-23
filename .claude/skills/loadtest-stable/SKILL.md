@@ -103,9 +103,13 @@ background during the load and fold its findings into your report under a separa
 - **Mempool depth = CometBFT `num_unconfirmed_txs`** (a `cometRPC` must be set).
   The EVM `txpool_*` RPCs are vestigial on stable (always 0) - never used. Without
   a CometRPC, Goal 2 is NOT EVALUATED.
-- **1-in-flight per account**: stable rejects future nonces (no queue). Load scales
-  with `funding.accountsN`, not per-account depth. To push a lane harder, raise
-  accountsN and the lane's `targetInflight`, not depth.
+- **1-in-flight per account/nonce-key**: stable rejects future nonces (no queue).
+  The bounded scheduler rotates a large account pool, skips accounts with a
+  pending standard nonce, and caps aggregate dispatch with `workload.targetTPS`.
+  `targetInflight` is retained as the relative workload weight; it is not depth.
+- **Reusable pool**: a secret `funding.accountSeed` deterministically derives
+  keys; `funding.accountsFile` contains only public indexes, addresses, and a
+  seed fingerprint. Seeded pools top up deficits and retain funds by default.
 - **VIP** needs a `role: vip` node; its nonce-key lane id is taken from on-chain.
 - **logPaths** are local-only ground truth for Goal 1/3. init.sh runs the
   validator in the foreground, so it does NOT write a validator log file - point

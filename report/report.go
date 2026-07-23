@@ -36,6 +36,10 @@ type Input struct {
 	LogScan   collector.LogScanResult
 	SentTotal int
 	Sent      []workload.KindCount
+	// Outcomes are the send-engine event counters (duplicates, conflicts,
+	// backpressure, replacements ...). A healthy run shows ~zero already-known
+	// / nonce-conflict events; non-zero counts point at admission friction.
+	Outcomes []workload.OutcomeCount
 }
 
 // Verdict is a machine-readable per-goal / overall outcome.
@@ -375,6 +379,19 @@ func Markdown(in Input) string {
 	}
 	fmt.Fprintf(&b, "\n")
 
+	// Send-engine outcomes: how the sender interacted with the chain's
+	// admission rules. already-known / nonce-conflict counts near zero mean no
+	// duplicate-nonce traffic; mempool-full-backoff counts are explicit chain
+	// backpressure (raise the node's mempool size or lower targetTPS).
+	if len(in.Outcomes) > 0 {
+		fmt.Fprintf(&b, "### Send outcomes\n\n")
+		fmt.Fprintf(&b, "| outcome | count |\n|---|---|\n")
+		for _, o := range in.Outcomes {
+			fmt.Fprintf(&b, "| %s | %d |\n", o.Outcome, o.Count)
+		}
+		fmt.Fprintf(&b, "\n")
+	}
+
 	return b.String()
 }
 
@@ -424,6 +441,7 @@ type jsonReport struct {
 	LogScan         collector.LogScanResult `json:"logScan"`
 	SentTotal       int                     `json:"sentTotal"`
 	Sent            []workload.KindCount    `json:"sent"`
+	Outcomes        []workload.OutcomeCount `json:"outcomes"`
 	Verdicts        Verdicts                `json:"verdicts"`
 	Reasons         map[string]string       `json:"reasons"`
 }
@@ -482,6 +500,7 @@ func Write(dir string, in Input) (string, error) {
 		LogScan:         in.LogScan,
 		SentTotal:       in.SentTotal,
 		Sent:            in.Sent,
+		Outcomes:        in.Outcomes,
 		Verdicts:        Evaluate(in),
 		Reasons:         reasons(in),
 	}

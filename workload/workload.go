@@ -8,11 +8,13 @@ import (
 	"math"
 	"math/big"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
@@ -129,13 +131,35 @@ type KindCount struct {
 	ExpectedLane int32  `json:"expectedLane"`
 }
 
-// Sink is a concurrency-safe AGGREGATE recorder of sent txs. It keeps only
-// per-kind counts (not every tx) so continuous runs do not grow unbounded.
+// Outcome labels one send-engine event class. The counts expose, per run, how
+// the engine interacted with the chain's admission rules - after the
+// duplicate-nonce fix a healthy run shows ~zero already-known / conflict-parked
+// events, and any mempool-full count is explicit chain backpressure.
+type Outcome string
+
+const (
+	OutcomeConfirmed      Outcome = "confirmed-in-block"      // resolved by the block-hash feed
+	OutcomeProbeConfirmed Outcome = "confirmed-by-probe"      // resolved by the committed-nonce probe
+	OutcomeDuplicate      Outcome = "already-known"           // node already had the identical tx
+	OutcomeConflictParked Outcome = "nonce-conflict-parked"   // slot held by an unknown tx of ours; parked
+	OutcomeNonceResync    Outcome = "nonce-resynced"          // stale nonce; resynced from committed state
+	OutcomeMempoolFull    Outcome = "mempool-full-backoff"    // chain backpressure; senders paused
+	OutcomeAmbiguous      Outcome = "ambiguous-parked"        // transport error; parked pending proof
+	OutcomeRejected       Outcome = "rejected"                // definitive rejection; slot reused
+	OutcomeBumped         Outcome = "fee-bumped-replacement"  // deliberate same-nonce replacement sent
+	OutcomeHardReset      Outcome = "hard-reset"              // slot unresolved past the escalation budget (stuck-slot signal)
+	OutcomeRetired        Outcome = "account-retired"         // insufficient funds; account dropped
+)
+
+// Sink is a concurrency-safe AGGREGATE recorder of sent txs and engine
+// outcomes. It keeps only counters (not every tx) so continuous runs do not
+// grow unbounded.
 type Sink struct {
-	mu      sync.Mutex
-	total   int
-	byKind  map[Kind]int
-	expLane map[Kind]int32
+	mu       sync.Mutex
+	total    int
+	byKind   map[Kind]int
+	expLane  map[Kind]int32
+	outcomes map[Outcome]int
 }
 
 func (s *Sink) Add(t SentTx) {
@@ -147,6 +171,16 @@ func (s *Sink) Add(t SentTx) {
 	s.total++
 	s.byKind[t.Kind]++
 	s.expLane[t.Kind] = t.ExpectedLane
+	s.mu.Unlock()
+}
+
+// Note counts one engine outcome event.
+func (s *Sink) Note(o Outcome) {
+	s.mu.Lock()
+	if s.outcomes == nil {
+		s.outcomes = make(map[Outcome]int)
+	}
+	s.outcomes[o]++
 	s.mu.Unlock()
 }
 
@@ -167,6 +201,37 @@ func (s *Sink) Stats() []KindCount {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Kind < out[j].Kind })
 	return out
+}
+
+// OutcomeCount is one outcome counter for reports.
+type OutcomeCount struct {
+	Outcome string `json:"outcome"`
+	Count   int    `json:"count"`
+}
+
+// Outcomes returns the engine outcome counters sorted by outcome name.
+func (s *Sink) Outcomes() []OutcomeCount {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]OutcomeCount, 0, len(s.outcomes))
+	for o, c := range s.outcomes {
+		out = append(out, OutcomeCount{Outcome: string(o), Count: c})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Outcome < out[j].Outcome })
+	return out
+}
+
+// outcomeSummary renders a compact k=v line for progress logs.
+func (s *Sink) outcomeSummary() string {
+	counts := s.Outcomes()
+	if len(counts) == 0 {
+		return "none"
+	}
+	parts := make([]string, 0, len(counts))
+	for _, c := range counts {
+		parts = append(parts, fmt.Sprintf("%s=%d", c.Outcome, c.Count))
+	}
+	return strings.Join(parts, " ")
 }
 
 // Builder builds and signs txs for each workload kind.
@@ -330,13 +395,10 @@ type Spec struct {
 	Inflight int
 }
 
-// Driver drives load with one goroutine per account, each strictly 1-in-flight:
-// send the next nonce, wait for its receipt, then send again. The stable chain
-// rejects future nonces (ErrNonceGap) with no queue, so per-account depth >1 is
-// impossible - lane oversubscription comes from running MANY accounts. VIP
-// (2D-nonce, key!=0) runs the same closed-loop on a few reserved accounts; its
-// sequence is seeded/resynced from the on-chain noncekey precompile. Unordered
-// txs are rate-limited fire-and-forget (they bypass nonce ordering).
+// Driver schedules a large account pool through a bounded set of workers over
+// the conflict-free lane engines (see engine.go). Standard kinds and VIP each
+// get an engine with its own ready queue and pending map; unordered txs bypass
+// nonce ordering by protocol design and stay fire-and-forget.
 type Driver struct {
 	pool    *accounts.Pool
 	builder *Builder
@@ -347,19 +409,21 @@ type Driver struct {
 	// workload is skipped entirely.
 	vipClient *ethclient.Client
 
-	feeCap  atomic.Pointer[big.Int]
-	tip     atomic.Pointer[big.Int]
-	recvTTL time.Duration
-	acctRR  atomic.Uint64 // round-robin account selector for unordered senders
+	feeCap atomic.Pointer[big.Int]
+	tip    atomic.Pointer[big.Int]
+
+	std     *laneEngine
+	vip     *laneEngine
+	hashIdx sync.Map // common.Hash -> *pendingTx (all engines; block-feed index)
+
+	unordRR        atomic.Uint64
+	backoffUntilNS atomic.Int64 // mempool-full global send pause (unixnano)
 }
 
 // NewDriver creates a driver. It seeds the cached fees immediately. vipClient
 // may be nil (no role:vip node configured) - VIP txs are then not sent.
 func NewDriver(ctx context.Context, pool *accounts.Pool, builder *Builder, sink *Sink, vipClient *ethclient.Client) (*Driver, error) {
-	// recvTTL is generous: blocks can legitimately take tens of seconds (funding
-	// allows 60s, setup 90s), and a too-short TTL would trip every worker into a
-	// nonce resync at once exactly when the chain is slow.
-	d := &Driver{pool: pool, builder: builder, sink: sink, vipClient: vipClient, recvTTL: 60 * time.Second}
+	d := &Driver{pool: pool, builder: builder, sink: sink, vipClient: vipClient}
 	if err := d.refreshFees(ctx); err != nil {
 		return nil, err
 	}
@@ -376,10 +440,13 @@ func (d *Driver) refreshFees(ctx context.Context) error {
 	return nil
 }
 
-// Run executes the enabled specs, recording every sent tx. If duration > 0 it
-// stops after that long; if duration <= 0 it runs until ctx is cancelled
-// (continuous mode).
-func (d *Driver) Run(ctx context.Context, duration time.Duration, specs []Spec) {
+// RunConfigured executes a deterministic weighted workload through at most
+// workers sender goroutines. targetTPS is an aggregate scheduling cap; zero
+// means the sender pool itself is the cap. Send slots that find every worker
+// busy are dropped (no burst backlog); sends that find every account in flight
+// are counted as starvation - that is the chain's inclusion rate acting as
+// natural backpressure, not an error.
+func (d *Driver) RunConfigured(ctx context.Context, duration time.Duration, specs []Spec, workers, targetTPS int) {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if duration > 0 {
@@ -387,49 +454,69 @@ func (d *Driver) Run(ctx context.Context, duration time.Duration, specs []Spec) 
 		defer cancel()
 	}
 
-	// Split specs into VIP, unordered, and standard (key-0) kinds.
-	var vipEnabled bool
-	unorderedInflight := 0
-	weighted := make([]Kind, 0, 32)
-	for _, s := range specs {
-		if s.Inflight <= 0 || !d.builder.Supports(s.Kind) {
-			continue
+	if workers <= 0 || len(d.pool.Accs) == 0 {
+		return
+	}
+	picker := newWeightedPicker(specs, func(kind Kind) bool {
+		if kind == KindVIP && d.vipClient == nil {
+			return false
 		}
-		if s.Kind == KindVIP {
-			// VIP txs require the dedicated role:vip endpoint. Without it, skip.
-			if d.vipClient == nil {
-				log.Printf("[load] VIP workload requested but no VIP RPC (role:vip node) configured - skipping VIP txs")
-				continue
-			}
+		return d.builder.Supports(kind)
+	})
+	if len(picker.entries) == 0 {
+		return
+	}
+	if targetTPS < 0 || targetTPS > int(time.Second) {
+		log.Printf("[load] invalid targetTPS=%d; no load sent", targetTPS)
+		return
+	}
+
+	vipEnabled, stdEnabled := false, false
+	for _, en := range picker.entries {
+		switch en.kind {
+		case KindVIP:
 			vipEnabled = true
-			continue
-		}
-		if s.Kind == KindUnordered {
-			unorderedInflight = s.Inflight
-			continue
-		}
-		// Repeat each kind proportional to its inflight so higher-target lanes
-		// are oversubscribed harder in the per-account mix.
-		reps := s.Inflight / 10
-		if reps < 1 {
-			reps = 1
-		}
-		for i := 0; i < reps; i++ {
-			weighted = append(weighted, s.Kind)
+		case KindUnordered:
+			// unordered runs off the shared pool; no engine needed
+		default:
+			stdEnabled = true
 		}
 	}
 
+	// Partition accounts: VIP reserves a fifth of the pool (whole pool when no
+	// standard kind runs). Per-sender ordered depth is 1 per nonce-key; keeping
+	// the partitions disjoint keeps each lane's admission independent.
 	accs := d.pool.Accs
-	// Reserve a few accounts for VIP closed-loop sending.
 	nVip := 0
 	if vipEnabled {
 		nVip = len(accs) / 5
 		if nVip < 1 {
 			nVip = 1
 		}
+		if !stdEnabled {
+			nVip = len(accs)
+		}
 	}
-	stdAccs := accs[nVip:]
-	vipAccs := accs[:nVip]
+	stdAccs, vipAccs := accs[nVip:], accs[:nVip]
+	if stdEnabled && len(stdAccs) == 0 {
+		log.Printf("[load] WARNING: no accounts left for standard kinds after VIP reservation (accountsN too small)")
+	}
+	d.std = newLaneEngine("std", 0,
+		d.pool.Client.SendTransaction,
+		func(ctx context.Context, addr common.Address) (uint64, error) {
+			return d.pool.Client.NonceAt(ctx, addr, nil)
+		},
+		stdAccs)
+	if vipEnabled {
+		vipKey := d.builder.NonceKey(KindVIP)
+		vipClient := d.vipClient
+		d.vip = newLaneEngine("vip", vipKey,
+			vipClient.SendTransaction,
+			func(ctx context.Context, addr common.Address) (uint64, error) {
+				return accounts.Nonce2D(ctx, vipClient, addr, vipKey)
+			},
+			vipAccs)
+	}
 
 	var wg sync.WaitGroup
 
@@ -449,203 +536,261 @@ func (d *Driver) Run(ctx context.Context, duration time.Duration, specs []Spec) 
 		}
 	}()
 
-	// Standard senders: one goroutine per account, each 1-in-flight closed-loop
-	// (send -> wait for its own receipt -> next). No shared confirmed-nonce poller
-	// is needed; per-send receipt confirmation tracks block speed instead of a
-	// fixed 1s cadence and avoids abandoning a merely-slow tx.
-	if len(weighted) > 0 {
-		for _, a := range stdAccs {
-			wg.Add(1)
-			go func(a *accounts.Account) {
-				defer wg.Done()
-				d.stdWorker(runCtx, a, weighted)
-			}(a)
+	// Confirmation feed: ONE hashes-only block fetch per new height on the
+	// primary endpoint (VIP txs land in the same blocks). The janitors'
+	// committed-nonce probes cover anything the block view might omit.
+	rc := d.pool.Client.Client()
+	head := func(ctx context.Context) (uint64, error) { return d.pool.Client.BlockNumber(ctx) }
+	hashes := func(ctx context.Context, height uint64) ([]common.Hash, error) {
+		var blk struct {
+			Transactions []common.Hash `json:"transactions"`
 		}
+		if err := rc.CallContext(ctx, &blk, "eth_getBlockByNumber", hexutil.EncodeUint64(height), false); err != nil {
+			return nil, err
+		}
+		return blk.Transactions, nil
 	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		d.confirmLoop(runCtx, defaultConfirmPoll, head, hashes)
+	}()
 
-	// VIP closed-loop senders: one goroutine per reserved account.
-	for _, a := range vipAccs {
+	// Janitors: probe overdue in-flight txs; escalate to fee-bumped replacement.
+	engines := []*laneEngine{d.std}
+	if d.vip != nil {
+		engines = append(engines, d.vip)
+	}
+	for _, e := range engines {
 		wg.Add(1)
-		go func(a *accounts.Account) {
+		go func(e *laneEngine) {
 			defer wg.Done()
-			d.vipWorker(runCtx, a)
-		}(a)
+			t := time.NewTicker(defaultJanitorEvery)
+			defer t.Stop()
+			for {
+				select {
+				case <-runCtx.Done():
+					return
+				case <-t.C:
+					e.janitorSweep(runCtx, d)
+				}
+			}
+		}(e)
 	}
 
-	// Unordered (2D-nonce, Nonce=0) senders: fire-and-forget across all accounts,
-	// RATE-LIMITED to ~unorderedInflight tx/sec so the flood does not starve the
-	// ordered lanes (unordered txs bypass nonce ordering and are accepted
-	// immediately, so uncapped they dominate every block). Each worker self-paces
-	// at interval = nWorkers/rate; enough workers run concurrently to absorb send
-	// latency so the aggregate rate is actually achieved (a single shared ticker
-	// would cap throughput at ~workers/send-latency and silently drop ticks).
-	if unorderedInflight > 0 {
-		nWorkers := unorderedInflight
-		if nWorkers > 32 {
-			nWorkers = 32
+	// Progress logger: the at-a-glance health line for a running load test.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		t := time.NewTicker(15 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-t.C:
+				line := fmt.Sprintf("[load] progress: accepted=%d std{pending=%d ready=%d starved=%d races=%d}",
+					d.sink.Total(), d.std.npend.Load(), len(d.std.ready), d.std.starved.Load(), d.std.busyRace.Load())
+				if d.vip != nil {
+					line += fmt.Sprintf(" vip{pending=%d ready=%d starved=%d races=%d}",
+						d.vip.npend.Load(), len(d.vip.ready), d.vip.starved.Load(), d.vip.busyRace.Load())
+				}
+				log.Printf("%s outcomes{%s}", line, d.sink.outcomeSummary())
+			}
 		}
-		perWorker := time.Duration(nWorkers) * time.Second / time.Duration(unorderedInflight)
-		if perWorker <= 0 {
-			perWorker = time.Millisecond
+	}()
+
+	// Pacer -> unbuffered token channel: a tick that finds every worker busy is
+	// DROPPED, so integer truncation and busy workers can never produce a burst.
+	var tokens chan struct{}
+	if targetTPS > 0 {
+		pacer, err := newIntegerPacer(targetTPS)
+		if err != nil {
+			log.Printf("[load] %v; no load sent", err)
+			return
 		}
-		for i := 0; i < nWorkers; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				d.unorderedWorker(runCtx, perWorker)
-			}()
-		}
+		tokens = make(chan struct{})
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for pacer.wait(runCtx) {
+				select {
+				case tokens <- struct{}{}:
+				default:
+				}
+			}
+		}()
+	}
+
+	var pickMu sync.Mutex
+	nextKind := func() (Kind, bool) {
+		pickMu.Lock()
+		defer pickMu.Unlock()
+		return picker.next()
+	}
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for runCtx.Err() == nil {
+				if tokens != nil {
+					select {
+					case <-runCtx.Done():
+						return
+					case <-tokens:
+					}
+				}
+				if d.backoffWait(runCtx) {
+					continue // chain said "mempool full"; skip this slot
+				}
+				kind, ok := nextKind()
+				if !ok {
+					return
+				}
+				sent := false
+				switch kind {
+				case KindUnordered:
+					sent = d.unorderedAttempt(runCtx)
+				case KindVIP:
+					if d.vip != nil {
+						sent = d.vip.sendOne(runCtx, d, KindVIP)
+					}
+				default:
+					sent = d.std.sendOne(runCtx, d, kind)
+				}
+				if tokens == nil && !sent {
+					// Uncapped mode: everything in flight - don't hot-spin.
+					if sleep(runCtx, 2*time.Millisecond) {
+						return
+					}
+				}
+			}
+		}()
 	}
 
 	wg.Wait()
 }
 
-// unorderedWorker fire-and-forgets unordered txs (NonceKey=MaxUint64, Nonce=0)
-// from rotating accounts, paced by the shared tick channel (rate limit). Each tx
-// is independent and deduped by its unique timeout, so there is no gap/wedge risk.
-func (d *Driver) unorderedWorker(ctx context.Context, interval time.Duration) {
+// backoffWait sleeps (bounded) while a mempool-full backoff is active.
+// Returns true when it consumed the caller's send slot.
+func (d *Driver) backoffWait(ctx context.Context) bool {
+	until := d.backoffUntilNS.Load()
+	now := time.Now().UnixNano()
+	if until <= now {
+		return false
+	}
+	dur := time.Duration(until - now)
+	if dur > 100*time.Millisecond {
+		dur = 100 * time.Millisecond
+	}
+	sleep(ctx, dur)
+	return true
+}
+
+// unorderedAttempt fire-and-forgets one unordered tx (NonceKey=MaxUint64,
+// Nonce=0, unique timeout) from a rotating account. No nonce state is touched:
+// unordered txs are deduped by (sender, timeout) and cannot conflict.
+func (d *Driver) unorderedAttempt(ctx context.Context) bool {
 	accs := d.pool.Accs
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		}
-		a := accs[int(d.acctRR.Add(1))%len(accs)]
-		tx, err := d.builder.build(KindUnordered, a, 0, d.feeCap.Load(), d.tip.Load())
-		if err != nil {
-			continue
-		}
-		if err := d.pool.Client.SendTransaction(ctx, tx); err != nil {
-			continue
-		}
+	a := accs[int(d.unordRR.Add(1))%len(accs)]
+	tx, err := d.builder.build(KindUnordered, a, 0, d.feeCap.Load(), d.tip.Load())
+	if err != nil {
+		return false
+	}
+	switch classifySendError(d.pool.Client.SendTransaction(ctx, tx)) {
+	case verdictAccepted:
 		d.sink.Add(SentTx{
 			Hash: tx.Hash(), From: a.Addr, Kind: KindUnordered,
 			ExpectedLane: d.builder.expectedLane[KindUnordered], Gas: tx.Gas(), SendTime: time.Now(),
 		})
-	}
-}
-
-// stdWorker submits standard (key-0) txs from one account, cycling the weighted
-// kind mix, strictly 1-in-flight (closed-loop): send the next nonce, wait for
-// its receipt, then send again. The stable chain rejects future nonces (no
-// queue), so depth >1 per account is impossible; concurrency comes from running
-// many accounts. Confirming via the tx's own receipt tracks block speed (vs a
-// fixed-cadence poller) and only re-seeds when a tx truly does not mine, so a
-// merely-slow tx is not abandoned.
-func (d *Driver) stdWorker(ctx context.Context, a *accounts.Account, weighted []Kind) {
-	// Seed the nonce from chain (prior phases - funding, token setup - advanced it).
-	if n, err := d.pool.Client.PendingNonceAt(ctx, a.Addr); err == nil {
-		a.SetBase(0, n)
-	}
-	for i := 0; ; i++ {
-		if ctx.Err() != nil {
-			return
-		}
-		k := weighted[i%len(weighted)]
-		nonce := a.Peek(0)
-		tx, err := d.builder.build(k, a, nonce, d.feeCap.Load(), d.tip.Load())
-		if err != nil {
-			if sleep(ctx, 200*time.Millisecond) {
-				return
-			}
-			continue
-		}
-		if err := d.pool.Client.SendTransaction(ctx, tx); err != nil {
-			// Do NOT commit (nonce reused next iteration). Resync from the PENDING
-			// nonce (includes in-flight) so we don't re-send a still-pending tx.
-			if n, e := d.pool.Client.PendingNonceAt(ctx, a.Addr); e == nil {
-				a.SetBase(0, n)
-			}
-			if sleep(ctx, 150*time.Millisecond) {
-				return
-			}
-			continue
-		}
-		d.sink.Add(SentTx{
-			Hash: tx.Hash(), From: a.Addr, Kind: k,
-			ExpectedLane: d.builder.expectedLane[k], Gas: tx.Gas(), SendTime: time.Now(),
-		})
-		if d.waitReceipt(ctx, d.pool.Client, tx.Hash()) {
-			a.Commit(0)
-		} else if n, e := d.pool.Client.PendingNonceAt(ctx, a.Addr); e == nil {
-			// Not mined within recvTTL: resync to the PENDING nonce. If the tx is
-			// still pending this advances PAST it (no double-send); if it was
-			// dropped, pending==latest and the slot is correctly reused.
-			a.SetBase(0, n)
-		}
-	}
-}
-
-// vipWorker submits VIP (2D-nonce) txs closed-loop from one dedicated account.
-// Commit happens only AFTER the receipt is observed, so a dropped/timed-out VIP
-// tx does not advance the nonce and leave a permanent gap - the same nonce is
-// retried. Sequential per account keeps the VIP stream valid without a 2D-nonce
-// confirmed query.
-func (d *Driver) vipWorker(ctx context.Context, a *accounts.Account) {
-	vipKey := d.builder.NonceKey(KindVIP)
-	// Seed the VIP (2D-nonce) sequence from the on-chain noncekey precompile.
-	// eth_getTransactionCount only reports nonce key 0, so without this the local
-	// counter would wrongly start at 0 for a key the account may have already
-	// used (prior run / preconfigured), and every VIP tx would be rejected.
-	if seq, err := accounts.Nonce2D(ctx, d.vipClient, a.Addr, vipKey); err == nil {
-		a.SetBase(vipKey, seq)
-	} else {
-		log.Printf("[vip] seed nonce via precompile failed for %s (key=%d): %v", a.Addr, vipKey, err)
-	}
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		nonce := a.Peek(vipKey)
-		tx, err := d.builder.build(KindVIP, a, nonce, d.feeCap.Load(), d.tip.Load())
-		if err != nil {
-			if sleep(ctx, 300*time.Millisecond) {
-				return
-			}
-			continue
-		}
-		// VIP txs go ONLY to the dedicated role:vip endpoint.
-		if err := d.vipClient.SendTransaction(ctx, tx); err != nil {
-			// Resync the VIP nonce from the precompile in case the local counter
-			// drifted from the on-chain 2D-nonce sequence.
-			if seq, e := accounts.Nonce2D(ctx, d.vipClient, a.Addr, vipKey); e == nil {
-				a.SetBase(vipKey, seq)
-			}
-			if sleep(ctx, 200*time.Millisecond) {
-				return
-			}
-			continue
-		}
-		d.sink.Add(SentTx{
-			Hash: tx.Hash(), From: a.Addr, Kind: KindVIP,
-			ExpectedLane: d.builder.expectedLane[KindVIP], Gas: tx.Gas(), SendTime: time.Now(),
-		})
-		if d.waitReceipt(ctx, d.vipClient, tx.Hash()) {
-			a.Commit(vipKey) // mined -> advance; else retry the same nonce
-		}
-	}
-}
-
-// waitReceipt polls client until the tx is mined (returns true) or recvTTL
-// elapses / ctx ends (returns false).
-func (d *Driver) waitReceipt(ctx context.Context, client *ethclient.Client, hash common.Hash) bool {
-	deadline := time.Now().Add(d.recvTTL)
-	for time.Now().Before(deadline) {
-		if ctx.Err() != nil {
-			return false
-		}
-		r, err := client.TransactionReceipt(ctx, hash)
-		if err == nil && r != nil {
-			return true
-		}
-		if sleep(ctx, 250*time.Millisecond) {
-			return false
-		}
+		return true
+	case verdictMempoolFull:
+		d.noteMempoolFull()
 	}
 	return false
+}
+
+// weightedPicker is deterministic smooth weighted round-robin. Advancing it is
+// independent of queue admission, so a saturated kind cannot pin the cursor.
+type weightedPicker struct {
+	entries []weightedEntry
+	total   int64
+}
+
+type weightedEntry struct {
+	kind    Kind
+	weight  int64
+	current int64
+}
+
+func newWeightedPicker(specs []Spec, supports func(Kind) bool) *weightedPicker {
+	entries := make([]weightedEntry, 0, len(specs))
+	for _, spec := range specs {
+		if spec.Inflight > 0 && supports(spec.Kind) {
+			entries = append(entries, weightedEntry{kind: spec.Kind, weight: int64(spec.Inflight)})
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].kind < entries[j].kind })
+	p := &weightedPicker{entries: entries}
+	for i := range entries {
+		p.total += entries[i].weight
+	}
+	return p
+}
+
+func (p *weightedPicker) next() (Kind, bool) {
+	if len(p.entries) == 0 {
+		return "", false
+	}
+	best := 0
+	for i := range p.entries {
+		p.entries[i].current += p.entries[i].weight
+		if p.entries[i].current > p.entries[best].current {
+			best = i
+		}
+	}
+	p.entries[best].current -= p.total
+	return p.entries[best].kind, true
+}
+
+// integerPacer emits no initial burst. Its kth deadline is
+// start+ceil(k*1s/target), so integer truncation can never exceed the cap.
+type integerPacer struct {
+	target uint64
+	baseNS uint64
+	remNS  uint64
+	carry  uint64
+}
+
+func newIntegerPacer(target int) (*integerPacer, error) {
+	if target <= 0 || target > int(time.Second) {
+		return nil, fmt.Errorf("target TPS must be between 1 and %d", time.Second)
+	}
+	t := uint64(target)
+	ns := uint64(time.Second)
+	return &integerPacer{target: t, baseNS: ns / t, remNS: ns % t, carry: t - 1}, nil
+}
+
+func (p *integerPacer) nextDelay() time.Duration {
+	delay := p.baseNS
+	p.carry += p.remNS
+	if p.carry >= p.target {
+		delay++
+		p.carry -= p.target
+	}
+	return time.Duration(delay)
+}
+
+func (p *integerPacer) wait(ctx context.Context) bool {
+	t := time.NewTimer(p.nextDelay())
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }
 
 // sleep waits d or until ctx is done; returns true if ctx ended.

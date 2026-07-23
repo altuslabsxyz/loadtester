@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
@@ -63,11 +64,18 @@ func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string)
 	}
 
 	// --- setup: connect pool, fund accounts, prepare token balances ---
-	pool, err := accounts.NewPool(ctx, tgt.PrimaryJSONRPC(), tgt.Funding.MasterKey, tgt.Funding.AccountsN, tgt.ChainID)
+	pool, err := accounts.NewPoolWithOptions(ctx, tgt.PrimaryJSONRPC(), tgt.Funding.MasterKey, tgt.Funding.AccountsN, tgt.ChainID, accounts.PoolOptions{
+		AccountSeed:  tgt.Funding.AccountSeed,
+		AccountsFile: tgt.Funding.AccountsFile,
+	})
 	if err != nil {
 		return fmt.Errorf("setup pool: %w", err)
 	}
-	log.Printf("[setup] chainId verified, %d accounts generated", len(pool.Accs))
+	mode := "ephemeral"
+	if tgt.Funding.AccountSeed != "" {
+		mode = "seeded/reusable"
+	}
+	log.Printf("[setup] chainId verified, %d %s accounts ready", len(pool.Accs), mode)
 	if err := pool.Fund(ctx, tgt.Funding.FundPerAccount); err != nil {
 		return fmt.Errorf("fund accounts: %w", err)
 	}
@@ -86,6 +94,7 @@ func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string)
 	}
 	builder := workload.NewBuilder(pool, abis, dep, plan.ExpectedLane)
 	builder.SetRecipientPoolSize(tgt.Workload.RecipientPoolSize)
+	specs := buildSpecs(tgt, builder)
 	switch n := tgt.Workload.RecipientPoolSize; {
 	case n == 0:
 		log.Printf("[setup] transfer recipients: one deterministic recipient per sender (capacity mode)")
@@ -94,7 +103,7 @@ func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string)
 	default:
 		log.Printf("[setup] transfer recipients: %d deterministic shared recipients", n)
 	}
-	if err := builder.PrepareAccounts(ctx); err != nil {
+	if err := builder.PrepareAccountsFor(ctx, specs); err != nil {
 		return fmt.Errorf("prepare token balances: %w", err)
 	}
 	log.Printf("[setup] token balances/approvals prepared")
@@ -232,6 +241,7 @@ func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string)
 			LogScan:         collector.NewLogScanCollector(tgt.LogPaths, runStart).Scan(),
 			SentTotal:       poolSink.Total(),
 			Sent:            poolSink.Stats(),
+			Outcomes:        poolSink.Outcomes(),
 			Mempool:         memCol.Result(),
 		}
 		return in
@@ -262,8 +272,6 @@ func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string)
 	if err != nil {
 		return fmt.Errorf("driver: %w", err)
 	}
-	specs := buildSpecs(tgt, builder)
-
 	if tgt.Workload.Continuous() {
 		reportEvery := time.Duration(tgt.Observe.ReportIntervalSec) * time.Second
 		if reportEvery <= 0 {
@@ -289,7 +297,7 @@ func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string)
 			}
 		}()
 
-		driver.Run(ctx, 0, specs) // blocks until ctx cancelled (SIGINT)
+		driver.RunConfigured(ctx, 0, specs, tgt.Workload.Workers, tgt.Workload.TargetTPS) // blocks until ctx cancelled (SIGINT)
 		rwg.Wait()
 		stopObs()
 		time.Sleep(500 * time.Millisecond)
@@ -301,7 +309,7 @@ func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string)
 	// One-shot mode.
 	dur := time.Duration(tgt.Workload.DurationSec) * time.Second
 	log.Printf("[load] running %d workload(s) for %s", len(specs), dur)
-	driver.Run(ctx, dur, specs)
+	driver.RunConfigured(ctx, dur, specs, tgt.Workload.Workers, tgt.Workload.TargetTPS)
 	log.Printf("[load] done; %d txs sent", poolSink.Total())
 
 	// --- drain: poll until the mempool actually empties (adaptive), capped ---
@@ -369,8 +377,8 @@ func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string)
 		// Detached context: if the operator Ctrl+C'd this one-shot, the run ctx is
 		// already cancelled, but we still want to recover funds before the random,
 		// in-memory-only account keys are gone. Bound it so a wedged endpoint can't
-		// hang shutdown forever. Sweeps run concurrently (distinct senders, one tx
-		// each, ~one block total), so a flat cap suffices regardless of accountsN.
+		// hang shutdown forever. Sweep RPC work uses a fixed-size worker pool, so a
+		// flat cap also bounds shutdown work for large account pools.
 		sweepCap := 5 * time.Minute
 		sweepCtx, cancel := context.WithTimeout(context.Background(), sweepCap)
 		if _, err := pool.Sweep(sweepCtx); err != nil {
@@ -378,7 +386,11 @@ func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string)
 		}
 		cancel()
 	} else {
-		log.Printf("[sweep] disabled (funding.sweepBack=false); funds left in load accounts are unrecoverable")
+		if tgt.Funding.AccountSeed != "" {
+			log.Printf("[sweep] disabled for reusable seeded pool; balances retained for the next run")
+		} else {
+			log.Printf("[sweep] disabled for ephemeral pool; remaining balances will be unrecoverable")
+		}
 	}
 
 	// CI gate: exit non-zero when the overall verdict meets the --fail-on
@@ -398,7 +410,13 @@ var poolSink workload.Sink
 
 func buildSpecs(tgt *config.Target, builder *workload.Builder) []workload.Spec {
 	var specs []workload.Spec
-	for key, load := range tgt.Workload.Lanes {
+	keys := make([]string, 0, len(tgt.Workload.Lanes))
+	for key := range tgt.Workload.Lanes {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		load := tgt.Workload.Lanes[key]
 		kind := workload.Kind(key)
 		if load.Enabled != nil && !*load.Enabled {
 			continue

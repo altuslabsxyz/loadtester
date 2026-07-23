@@ -12,8 +12,8 @@ contract addresses (empty `{}` is fine for token-free workloads). `loadtester
 start` runs these phases in order:
 
 1. **connect + chainId check** — dials the load endpoint; aborts on `eth_chainId` mismatch.
-2. **fund** — `fundPerAccount` reaches each of `accountsN` fresh random accounts via a FAN-OUT TREE (~log2(accountsN) blocks - see 1-in-flight below).
-3. **token prep** — `PrepareAccounts` mints/approves test tokens (only if the deployment has them; skipped for token-free workloads).
+2. **fund** — random accounts are generated or seeded accounts are re-derived; balances/nonces are read with bounded workers and only deficits are funded via a fan-out tree.
+3. **token prep** — bounded workers mint/approve only tokens required by enabled workloads (skipped for token-free workloads).
 4. **lanes** — register (fast-pass/real-vote) OR read/assume (preconfigured) the lane params; build the classifier + per-lane quotas.
 5. **observe** — start 3 collectors: Lane (per-lane gas attribution), Mempool (CList depth), AppHash (per-node app_hash + stall).
 6. **load** — drive the workload mix for `durationSec` (one-shot) or until Ctrl+C (continuous).
@@ -34,14 +34,32 @@ The stable app does NOT wire cosmos-evm's geth txpool, so the EVM `txpool_status
 only trustworthy mempool-depth signal is the CometBFT CList via a node's
 `cometRPC`. **No `cometRPC` reachable → Goal 2 is NOT EVALUATED** (never a false PASS).
 
-### 1-in-flight per account (future nonces are rejected, not queued)
+### Bounded account rotation and 1-in-flight nonce safety
 The ante rejects `txNonce > accountNonce` with `ErrNonceGap` and there is NO
 future/queued lane — a gapped tx is dropped. So an account can have at most ONE
 in-flight tx. Consequences:
-- The driver is **closed-loop**: send one tx → wait for its receipt → send the next.
-- **Concurrency comes from the NUMBER of accounts (`accountsN`), not depth.** To push harder, raise `accountsN`, not per-account inflight.
-- **Funding fans out as a tree**: one sender can still fund only one account per block (blasting from the master would get all-but-the-first dropped), so each round the master AND every already-funded account fund one new account — the funded set doubles per block. Intermediate accounts receive their own share plus everything they must forward, so the master float is unchanged. (Funding takes ~`log2(accountsN)` blocks, not ~`accountsN`; the sweep-back is likewise concurrent — distinct senders, one tx each.)
-- `unordered` txs are exempt (NonceKey=MaxUint64) and are rate-limited fire-and-forget.
+- The driver is **open-loop and globally paced**, with at most `workload.workers`
+  attempts active and no initial rate burst. A full queue drops a dispatch
+  opportunity instead of accumulating stale work.
+- `accountsN` controls address-rotation length, while `workers` controls RPC
+  concurrency and `targetTPS` controls aggregate rate. `targetInflight` is a
+  deterministic relative weight between enabled workload kinds.
+- Each account/nonce-key is guarded by an exclusive slot. Standard sends compare
+  confirmed and pending nonces: pending work is skipped; equality sends the
+  confirmed nonce, which also safely reuses a previously dropped transaction.
+- **Funding fans out as a tree**: one sender can still fund only one account per block (blasting from the master would get all-but-the-first dropped), so each round the master AND every already-funded account fund one new account — the funded set doubles per block. Intermediate accounts receive their own share plus everything they must forward, so the master float is unchanged. (Funding takes ~`log2(accountsN)` blocks, not ~`accountsN`; both funding and sweep stay bounded by fixed worker pools, and broadcasts are serialized to avoid the node's account-creation race.)
+- `unordered` txs are exempt (NonceKey=MaxUint64) and share the same global rate/workers cap.
+
+### Reusable deterministic account pools
+When `funding.accountSeed` is set, account `i` is derived by a versioned,
+domain-separated Keccak-based KDF using fixed-width big-endian index/retry
+fields. The seed must be at least 32 bytes and is a private signing secret.
+`funding.accountsFile` is atomically written in index order and contains only
+public addresses plus a seed fingerprint; it can be committed for operational
+funding/reconciliation. Reusing the same seed, count, and derivation version
+recreates the same keys. Funding credits existing balances exactly and sends
+only required top-ups. Seeded pools retain balances by default; ephemeral pools
+sweep by default.
 
 ### Concurrent broadcasts can panic the node's CheckTx (account-creation race)
 Two `eth_sendRawTransaction` calls processed concurrently by a node can race in
@@ -114,9 +132,8 @@ Goal 1 and Goal 3 are INCONCLUSIVE by nature — that is honest, not a failure.
 - The generator only produces value / erc20Transfer / swap / vip / unordered tx
   SHAPES; a lane whose matcher none of these hit is reported **NOT EXERCISED**
   (never silently "passed").
-- Funds sent to the random load accounts are swept back to the master at the end
-  of a one-shot run by default (`funding.sweepBack: true`); with it off, or in
-  continuous mode (Ctrl+C interrupts first), they're stranded on in-memory keys
-  and lost. Either way the full float is needed upfront (precheck).
+- Random ephemeral load accounts sweep at the end of a one-shot run by default;
+  disabling that strands funds on keys that disappear. Seeded pools do not
+  sweep by default because their keys and balances are intentionally reusable.
 - gRPC is insecure-only (no TLS); single VIP lane only; reconciliation checks
   declared⊆on-chain (extra on-chain lanes are not surfaced).

@@ -60,7 +60,13 @@ type LaneCollector struct {
 	mu        sync.Mutex
 	res       LaneResult
 	lastBlock uint64
+	primed    bool
 }
+
+// laneCatchupMax bounds full-tx block fetches per poll tick: after a stall or
+// a slow poll the collector catches up gradually instead of stampeding the
+// node (a 10k-tx block is a multi-MB response).
+const laneCatchupMax = 64
 
 func NewLaneCollector(client *ethclient.Client, classifier *Classifier, params *stabletypes.Params, maxBlockGas uint64) *LaneCollector {
 	names := map[int32]string{laneNormalID: "normal"}
@@ -105,10 +111,38 @@ func (lc *LaneCollector) poll(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	for h := lc.lastBlock + 1; h <= head; h++ {
+	from, to, ok := lc.nextBatch(head)
+	if !ok {
+		return
+	}
+	for h := from; h <= to; h++ {
 		lc.processBlock(ctx, h)
 		lc.lastBlock = h
 	}
+}
+
+// nextBatch advances the cursor for the observed head and returns the
+// inclusive block range to process this tick, capped at laneCatchupMax.
+//
+// The first observation primes the cursor at the CURRENT head: on a
+// long-lived chain, walking up from genesis grinds through millions of
+// historic/pruned heights (every fetch erroring or wasted) and never reaches
+// the blocks of THIS run - the devnet bench reported "Blocks observed: 0"
+// for exactly that reason.
+func (lc *LaneCollector) nextBatch(head uint64) (from, to uint64, ok bool) {
+	if !lc.primed {
+		lc.primed = true
+		if head == 0 {
+			return 0, 0, false
+		}
+		lc.lastBlock = head - 1 // observe the block at run start first
+	}
+	if lc.lastBlock >= head {
+		return 0, 0, false
+	}
+	from = lc.lastBlock + 1
+	to = min(head, lc.lastBlock+laneCatchupMax)
+	return from, to, true
 }
 
 func (lc *LaneCollector) processBlock(ctx context.Context, height uint64) {

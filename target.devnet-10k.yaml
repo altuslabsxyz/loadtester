@@ -1,0 +1,64 @@
+# 10k-txs-per-block devnet target — TEMPLATE (fill <PLACEHOLDER>s; do not commit a real key).
+#
+# Loadtester-side this reaches 10k txs/block; the CHAIN must also be configured for it,
+# or blocks stop far earlier no matter what this tool sends:
+#   1. genesis consensus.params.block.max_gas: the DEFAULT (normal) lane must see >= 210M gas
+#      (10k x 21k). With stable.params.max_blockspace_gas_weight=50 that means max_gas ~ 420M.
+#      The 2026-07-23 bench genesis (~100M) ceilinged at 2,377 value txs (~49.9M lane share).
+#   2. config.toml [mempool] size >= 20000-30000 on BOTH RPC nodes and the fullnodes they feed
+#      (bench boxes showed a ~10k ceiling: depth pinned 7.0k-9.8k, max 9,874).
+#   3. Expect the block interval to stretch well past timeout_commit=650ms when blocks carry
+#      ~210M gas of execution (that stretch is the iavl/memiavl x block-STM comparison itself).
+#      The sender's confirmation feed adapts to the real cadence automatically.
+#
+# Spend math (from the bench's own fees, ~0.0000446 native/tx at 21k gas x ~2.125 gwei-eq):
+#   sustained 14,000 tx/s x durationSec 150 ~ 2.1M txs ~ 94 native tokens total gas.
+#   The seeded pool retains balances (sweepBack defaults OFF with accountSeed), so later runs
+#   only top up. Master must float accountsN x fundPerAccount UPFRONT on the first run:
+#   50,000 x 0.002 = 100 tokens.
+
+name: stable-devnet-10k
+chainId: 988
+cosmosChainId: "stable_988-1"
+
+nodes:
+  - name: normal-rpc
+    role: fullnode                       # receives value/erc20/swap/unordered load
+    jsonrpc: "http://10.10.30.10:8555"
+    cometRPC: ""                         # set (e.g. http://10.10.30.10:26657) to enable Goal 2 mempool-drain + block max_gas readout
+    grpc: ""
+  - name: enterprise-rpc
+    role: vip                            # ONLY endpoint guaranteedTx (vip) txs go to
+    jsonrpc: "http://10.10.30.10:8545"
+    cometRPC: ""
+    grpc: ""
+  # Optional: add a validator cometRPC for cross-node app-hash compare (Goal 3):
+  # - { name: val1, role: validator, jsonrpc: "http://10.10.30.11:8545", cometRPC: "http://10.10.30.11:26657" }
+
+funding:
+  masterKey: "<FUNDED_HEX_PRIVATE_KEY>"
+  accountsN: 50000                       # >= ~3x the per-block target: 10k txs/block needs >10k accounts PENDING at proposal
+  fundPerAccount: "0.002"                # ~45 txs of gas each; top-up runs replace only what was spent
+  accountSeed: "<0x_AT_LEAST_32_RANDOM_SECRET_BYTES>"  # SECRET - same seed = same reusable pool
+  accountsFile: "accounts/load-pool.json"              # public address manifest (safe to commit)
+
+governance:
+  mode: preconfigured
+
+workload:
+  durationSec: 150                       # one-shot => verdict; scale up once the first run is clean
+  workers: 512                           # RPC concurrency cap (LAN: ~100-200 in flight at 14k TPS)
+  targetTPS: 14000                       # 10k per 0.73s block; engine self-throttles to real inclusion rate
+  recipientPoolSize: 0
+  allowDestructive: false
+  lanes:
+    value: { targetInflight: 100 }       # the 10k/block driver: 21k-gas native transfers
+    vip:   { targetInflight: 10 }        # keep the guaranteed lane exercised (its quota is separate)
+    # unordered: { targetInflight: 10 }  # optional: STAB-185 selective-recheck pressure
+    # erc20Transfer/swap: keep DISABLED until the chain-side precisebank async-CheckTx
+    # account-creation panic is fixed (token prep mints trip it).
+
+observe:
+  pollIntervalMs: 500
+  drainWindowSec: 180
+  reportIntervalSec: 30

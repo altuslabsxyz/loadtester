@@ -17,8 +17,11 @@ nodes:                        # >=1; jsonrpc required. cometRPC/grpc optional.
     grpc: ""                  # optional; cosmos gRPC for on-chain lane params. INSECURE-only dial -> leave "" for TLS testnets
 funding:
   masterKey: "0x<hex>"        # funded key; signs only the funding txs (preconfigured mode)
-  accountsN: <int>            # number of load accounts (= concurrency; each is 1-in-flight)
+  accountsN: <int>            # deterministic rotation-pool size; not worker concurrency
   fundPerAccount: "0.01"      # DECIMAL whole gas tokens per account (fractional ok; ×1e18 to wei). Fund only what gas needs.
+  accountSeed: "0x<64+ hex>"  # optional SECRET; derives the same accounts every run
+  accountsFile: accounts.json # optional public address/index/fingerprint manifest; requires accountSeed
+  # sweepBack: false          # default: false for seeded pools, true for random ephemeral pools
 governance:
   mode: preconfigured         # testnet: lanes already registered, declared below. (fast-pass/real-vote = local only)
   proposerKey: ""             # fast-pass/real-vote only
@@ -34,8 +37,10 @@ blockspace:                   # OPTIONAL. Omit -> built-in preset. Declare the A
     # addrs: 0x.. or @name deploy ref; methods: 4-byte hex; txTypes: LEGACY|ACCESS_LIST|DYNAMIC_FEE|SET_CODE|TWO_D_NONCE
 workload:
   durationSec: 120            # >0 = one-shot (yields a verdict). <=0 = continuous (LIVE, NO verdict)
+  workers: 256                # cap on concurrent load-generator goroutines/RPC work
+  targetTPS: 5000             # aggregate dispatch cap; 0 = uncapped
   allowDestructive: false     # gate bump/selfdestruct (keep false on testnet)
-  lanes:                      # which tx kinds to send + per-account target (see kinds below)
+  lanes:                      # targetInflight is retained as the relative workload weight
     value:     { targetInflight: 30 }
     unordered: { targetInflight: 20 }
     # erc20Transfer / swap / vip / bump / selfdestruct (toggle by presence; enabled: false to disable)
@@ -47,8 +52,8 @@ logPaths:                     # local only: proposer/validator log file(s) for G
   - /tmp/initsh.log
 ```
 
-Defaults if omitted: `governance.mode=preconfigured`, `pollIntervalMs=200`,
-`drainWindowSec=60`. Only `chainId` + one `jsonrpc` are strictly required.
+Defaults if omitted: `governance.mode=preconfigured`, `workload.workers=256`,
+`workload.targetTPS=0`, `pollIntervalMs=200`, `drainWindowSec=60`.
 
 ## Workload kinds (each value/vip/unordered sends 1 wei)
 
@@ -66,29 +71,28 @@ Token-free set (`value`, `vip`, `unordered`) needs no deployed contracts → use
 
 ## Capping spend (how to use only N of a funded account)
 
-There is no spend-cap field. In `preconfigured` mode the master's ONLY outflow is
-funding, so:
+There is no spend-cap field. For an empty/new pool, approximate first-run float as:
 
 ```
 master outflow  =  accountsN x fundPerAccount   (in WHOLE gas tokens)
 ```
 
-Set that product ≤ your budget. **Units:** whole tokens. `fundPerAccount: "1"` =
-1 whole token = `1e18` atomic (e.g. 1 USDT0 = 1e18 ausdt0). So `accountsN: 50,
-fundPerAccount: "1"` ⇒ master spends 50 whole tokens. The master-balance precheck
-aborts (no spend) if it can't cover `product + gas`.
+Set that product within budget. **Units:** whole tokens; `fundPerAccount: "1"`
+means `1e18` wei. The balance-aware funding plan computes exact root transfers
+plus gas and aborts before sending if the master cannot cover them. Later seeded
+runs read balances first and top up only deficits; a fully funded pool sends zero
+top-up transactions.
 
-**Funds are recovered by default** (`funding.sweepBack: true`): at the end of a
-one-shot run each load account's leftover balance is returned to the master
-(minus one tx of gas), so the *net* cost is only gas. BUT the master must still
-hold the full `accountsN × fundPerAccount` **upfront to float** during the run —
-the precheck aborts otherwise — so the balance caps `accountsN` even though it's
-returned afterward. With `sweepBack: false` (or in continuous mode, where Ctrl+C
-interrupts before the sweep) each account's fund is stranded on a random,
-in-memory-only key and lost. More `accountsN` = more load (funding fans out as
-a doubling tree, ~`log2(accountsN)` blocks, and the sweep runs concurrently, so
-account count barely affects setup time). Prefer many accounts × small fund
-(e.g. `50 × 1`).
+**Sweep defaults depend on pool mode.** Random ephemeral pools sweep after a
+one-shot run because their keys disappear. Seeded pools default to no sweep so
+balances remain reusable; the seed must remain securely backed up. Funding and
+sweep RPC work use fixed-size worker pools, so a 50k-address pool does not create
+50k goroutines or connections.
+
+For high rate with low nonce pressure, prefer a large seeded pool and bounded
+workers. Example: `accountsN: 50000`, `targetTPS: 5000`, `workers: 256` revisits
+an address about every 10 seconds while allowing only 256 concurrent attempts.
+The address manifest may be committed; **never commit `accountSeed`**.
 
 ## Procedure (preconfigured testnet)
 
@@ -109,7 +113,7 @@ From `out/report.json`:
 - Markdown's lane table flags **NOT EXERCISED** lanes (declared/registered but no traffic — NOT verified).
 Relay PASS/FAIL plainly, and call INCONCLUSIVE/NOT_EVALUATED "not proven", not "fine".
 
-## Worked example — public testnet, token-free, cap 50 USDT0 (validated)
+## Worked example — public testnet, reusable token-free pool
 
 ```yaml
 name: stable-testnet
@@ -119,12 +123,16 @@ nodes:
   - { name: rpc, role: fullnode, jsonrpc: https://rpc.testnet.stable.xyz, cometRPC: https://<cosmos-rpc-host>, grpc: "" }
 funding:
   masterKey: "0x<your funded key>"
-  accountsN: 50
-  fundPerAccount: "1"         # 50 x 1 = 50 USDT0 max outflow
+  accountsN: 50000
+  fundPerAccount: "0.001"
+  accountSeed: "0x<secret 32-byte-or-longer hex seed>"
+  accountsFile: accounts.testnet.json
 governance:
   mode: preconfigured
 workload:
   durationSec: 120
+  workers: 256
+  targetTPS: 5000
   allowDestructive: false
   lanes:
     value:     { targetInflight: 30 }
@@ -133,10 +141,10 @@ observe:
   pollIntervalMs: 1000
   drainWindowSec: 60
 ```
-This run sent ~6300 txs, drained the CList to 0 (Goal 2 PASS), reported Goal 1/3
-INCONCLUSIVE (no logs / single endpoint), spent ~50 USDT0. To prove Goal 1 you
-need `blockspace.lanes` declared + reachable gRPC + enough load to exceed a lane
-quota; for Goal 3 you need ≥2 node endpoints.
+The first run writes the public manifest and funds/top-ups the deterministic
+pool. Later runs with the same seed and `accountsN` reuse the same addresses.
+To prove Goal 1 you need `blockspace.lanes` declared + reachable gRPC + enough
+load to exceed a lane quota; for Goal 3 you need ≥2 node endpoints.
 
 ## Local init.sh example (3 nodes, lane enforcement provable)
 Use `role: vip` node (8555), set `logPaths: [/tmp/initsh.log]` (the foreground

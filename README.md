@@ -87,15 +87,53 @@ Phases: connect + chainId sanity check → fund N accounts → mint/approve test
 tokens → register lanes (governance) → start collectors → drive workloads for
 `durationSec` → wait `drainWindowSec` → write `out/report.md` + `out/report.json`.
 
+### Reusable high-rate account pools
+
+Account count, concurrency, and rate are independent controls. For example,
+50,000 accounts at 5,000 tx/s revisit an account about once every ten seconds,
+while `workers: 256` bounds client/RPC concurrency:
+
+```yaml
+funding:
+  accountsN: 50000
+  accountSeed: "0x<at-least-32-random-secret-bytes>" # signing authority; never commit
+  accountsFile: "accounts/load-pool.json"            # public addresses only
+  fundPerAccount: "0.01"
+workload:
+  workers: 256
+  targetTPS: 5000
+```
+
+The same seed and index regenerate the same signing key. The manifest contains
+only versioned public addresses and a seed fingerprint, never private material.
+Later runs query balances with bounded concurrency and top up only deficits.
+Seeded pools default to `sweepBack: false`, retaining funds for reuse.
+
+Ordered sends run through a conflict-free engine (`workload/engine.go`). On
+this chain `eth_getTransactionCount("pending")` never reflects the mempool (the
+EVM txpool is vestigial) and each sender may hold at most ONE ordered tx per
+nonce-key, so the engine keeps its own ownership state: an account is eligible
+only while it has no tx in flight; an accepted send parks it until the
+block-hash feed (one hashes-only block fetch per new height) or a
+committed-nonce probe proves the slot resolved. The only same-nonce resend the
+engine can produce is a deliberate replacement — fee-bumped ~1.3x after a 90s
+TTL — so the mempool's "tx already in mempool" and "doesn't fit the replacement
+rule" rejections cannot be triggered by ordinary scheduling. A full worker
+queue drops that scheduling opportunity instead of accumulating stale work, so
+`targetTPS` is a cap and target, not a throughput guarantee. Per-run send
+outcomes (duplicates, conflicts, backpressure, replacements) are counted in
+`report.json` under `outcomes` and logged every 15s; a healthy run shows ~zero
+conflict counters, and `mempool-full-backoff` marks explicit chain backpressure.
+
 ### Workload kinds
 
 `value`, `erc20Transfer`, `swap`, `vip` (2D-nonce VIP), `bump` / `selfdestruct`
 (determinism, need `allowDestructive`), and `unordered` (2D-nonce unordered tx:
 NonceKey=MaxUint64, Nonce=0, unique future timeout - exercises the
 selective-recheck/STAB-185 eviction path). Toggle each via `workload.lanes`
-(omit a key or set `targetInflight: 0`). `unordered` is fire-and-forget
-(high-rate; its `targetInflight` caps the worker count, max 32), so keep it
-modest relative to the other lanes.
+(omit a key or set `targetInflight: 0`). `unordered` is fire-and-forget and
+shares the same aggregate worker/TPS bounds. `targetInflight` is a deterministic
+relative mix weight for every kind.
 
 ### Config-driven lanes (general use)
 
@@ -137,12 +175,11 @@ CometBFT RPC, no gRPC, and no validator keys. The harness degrades to that:
    (otherwise the mint reverts and setup aborts with a clear error).
 4. `loadtester start -t target.yaml` (continuous by default). For CI, run a
    one-shot (`durationSec > 0`) with `--fail-on=fail` (or `review`).
-5. Funds recovery: by default (`funding.sweepBack: true`) each load account's
-   leftover balance is returned to the master at the end of a **one-shot** run, so
-   the net cost is only gas. The full `accountsN × fundPerAccount` must still be on
-   the master **upfront** to float the run. Set `sweepBack: false` (or use
-   continuous mode, where Ctrl+C interrupts before the sweep) to leave funds
-   stranded on the random, in-memory-only account keys — unrecoverable.
+5. Funds recovery: ephemeral random pools default to `sweepBack: true`; each
+   account returns its leftover balance after a **one-shot** run. Seeded pools
+   default to `false` so balances remain available on the next run, which tops
+   up only underfunded accounts. The seed is required to recover or reuse those
+   balances and must be backed up securely.
 
 What is observable on a JSON-RPC-only target:
 

@@ -31,11 +31,14 @@ nodes:
 # ── Funding ──────────────────────────────────────────────────────────────
 funding:
   masterKey: "0x..."           # pre-funded key; fans out to the load accounts
-  accountsN: 20                # number of load accounts to generate
+  accountsN: 50000             # pool size; larger pools increase nonce-reuse distance, not concurrency
   fundPerAccount: "1"          # decimal whole native tokens per account (e.g. "0.01"); fund only what gas needs
+  # accountSeed: "0x..."       # SECRET, >=32 random bytes; recreates the same signing keys
+  # accountsFile: "accounts/load-pool.json" # public address-only manifest; requires accountSeed
   # sweepBack: true            # default on: return each account's leftover to the master at end of a
                                # one-shot run (net cost = gas only). Full accountsN x fundPerAccount is
-                               # still needed UPFRONT to float. Set false to leave funds stranded (lost).
+                               # still needed UPFRONT for a new pool. Seeded pools default OFF and later
+                               # runs top up only deficits; explicit true/false always overrides.
 
 # ── Governance (how lanes get registered) ─────────────────────────────────
 governance:
@@ -64,6 +67,8 @@ governance:
 # ── Workload (what to send, how hard) ──────────────────────────────────────
 workload:
   durationSec: 0               # >0 = one-shot for N seconds; <=0 = CONTINUOUS (until Ctrl+C)
+  workers: 256                 # hard cap on sender goroutines/RPC concurrency (default 256)
+  targetTPS: 5000              # aggregate scheduling cap; 0 = worker-bounded/unlimited
   allowDestructive: false      # gate bump/selfdestruct (keep false on a testnet)
   # Transfer-recipient contention topology:
   #   0/omitted = deterministic recipient per sender (capacity benchmark)
@@ -71,8 +76,8 @@ workload:
   #   N > 1     = deterministically shard senders across N shared recipients
   recipientPoolSize: 0
   lanes:
-    # Relative targetInflight sets the per-account mix ratio (quantized to /10)
-    # for the standard kinds. Drop a key or set targetInflight: 0 to disable it.
+    # Relative targetInflight sets the deterministic workload mix weight.
+    # It does not create workers or override targetTPS.
     # value/vip/unordered need NO deployed/mintable token - safe on a bare RPC.
     value:         { targetInflight: 20 }   # native transfer
     vip:           { targetInflight: 20 }   # 2D-nonce VIP tx (needs a role:vip node; else skipped)

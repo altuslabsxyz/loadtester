@@ -5,10 +5,14 @@
 package config
 
 import (
+	"encoding/hex"
 	"fmt"
+	"math/big"
 	"os"
+	"sort"
 	"strings"
 
+	"github.com/ethereum/go-ethereum/crypto"
 	"gopkg.in/yaml.v3"
 )
 
@@ -54,18 +58,36 @@ type Funding struct {
 	MasterKey      string `yaml:"masterKey"`      // hex private key, with or without 0x
 	AccountsN      int    `yaml:"accountsN"`      // number of load accounts to generate
 	FundPerAccount string `yaml:"fundPerAccount"` // decimal whole gas tokens, e.g. "0.01" or "1" (fractional supported; ×1e18 to wei)
+	// AccountSeed, when set, derives load-account private keys from this hex
+	// seed using versioned domain-separated hashing. The same seed always yields
+	// the same N addresses, so a pool can be REUSED
+	// across runs: fund it once, and later runs top up only what is underfunded
+	// (no new accounts created). Empty = ephemeral random accounts (legacy: keys
+	// exist only in memory for the run and are swept back at the end).
+	AccountSeed string `yaml:"accountSeed"`
+	// AccountsFile, when non-empty, is the path the derived address list is
+	// written to after the pool is built (addresses + index + seed fingerprint,
+	// for reference / external funding / committing to the repo). The private
+	// keys are NEVER written - they stay derived from the seed at runtime.
+	AccountsFile string `yaml:"accountsFile"`
 	// SweepBack controls whether, at the end of a one-shot run, each load
 	// account's leftover native balance is returned to the master (minus one
-	// tx of gas). The load-account keys are random and in-memory only, so funds
-	// left in them are unrecoverable once the process exits - sweeping recovers
-	// ~all of what Fund sent out. Default (nil/omitted) is ON; set to false to
-	// leave funds stranded (e.g. for post-run inspection). No effect in
-	// continuous mode (Ctrl+C interrupts before a sweep can run).
+	// tx of gas). Default (nil/omitted): ON for ephemeral random accounts (whose
+	// keys are lost at exit), OFF when accountSeed is set (funds stay in the
+	// reusable pool for the next run). Set explicitly to override either default.
+	// No effect in continuous mode (Ctrl+C interrupts before a sweep can run).
 	SweepBack *bool `yaml:"sweepBack"`
 }
 
-// ShouldSweep reports whether end-of-run fund recovery is enabled (default on).
-func (f Funding) ShouldSweep() bool { return f.SweepBack == nil || *f.SweepBack }
+// ShouldSweep reports whether end-of-run fund recovery is enabled. Default: on
+// for ephemeral (random) accounts so funds are not stranded in lost keys; off
+// for a seeded, reusable pool so the funds persist for the next run.
+func (f Funding) ShouldSweep() bool {
+	if f.SweepBack != nil {
+		return *f.SweepBack
+	}
+	return f.AccountSeed == ""
+}
 
 // Governance describes lane-registration behavior.
 type Governance struct {
@@ -93,6 +115,10 @@ type LaneLoad struct {
 type Workload struct {
 	DurationSec int                 `yaml:"durationSec"`
 	Lanes       map[string]LaneLoad `yaml:"lanes"`
+	// Workers bounds load-generation goroutines. Default 256.
+	Workers int `yaml:"workers"`
+	// TargetTPS is the optional aggregate send-rate cap. 0 means uncapped.
+	TargetTPS int `yaml:"targetTPS"`
 	// RecipientPoolSize controls shared-recipient contention for transfer workloads.
 	//   0 (default): one deterministic recipient per sender, for parallel-capacity tests.
 	//   1:           one shared hot recipient, reproducing the legacy contention test.
@@ -196,6 +222,9 @@ func (t *Target) applyDefaults() {
 	if t.Governance.Mode == "" {
 		t.Governance.Mode = GovPreconfigured
 	}
+	if t.Workload.Workers == 0 {
+		t.Workload.Workers = 256
+	}
 	// NOTE: durationSec is intentionally NOT defaulted. durationSec <= 0 means
 	// CONTINUOUS (run until interrupted); a positive value means one-shot.
 }
@@ -207,8 +236,52 @@ func (t *Target) validate() error {
 	if len(t.Nodes) == 0 {
 		return fmt.Errorf("at least one node is required")
 	}
+	if t.Funding.AccountsN <= 0 {
+		return fmt.Errorf("funding.accountsN must be > 0")
+	}
+	if strings.TrimSpace(t.Funding.MasterKey) == "" {
+		return fmt.Errorf("funding.masterKey is required")
+	}
+	if _, err := crypto.HexToECDSA(strings.TrimPrefix(strings.TrimSpace(t.Funding.MasterKey), "0x")); err != nil {
+		return fmt.Errorf("funding.masterKey is not parseable: %w", err)
+	}
+	fundWei, err := parsePositiveWholeTokensToWei(t.Funding.FundPerAccount)
+	if err != nil {
+		return err
+	}
+	if fundWei.Sign() <= 0 {
+		return fmt.Errorf("funding.fundPerAccount must be > 0")
+	}
+	if strings.TrimSpace(t.Funding.AccountSeed) != "" {
+		seed, err := hex.DecodeString(strings.TrimPrefix(strings.TrimSpace(t.Funding.AccountSeed), "0x"))
+		if err != nil {
+			return fmt.Errorf("funding.accountSeed must be hex: %w", err)
+		}
+		if len(seed) < 32 {
+			return fmt.Errorf("funding.accountSeed must be at least 32 bytes")
+		}
+	} else if strings.TrimSpace(t.Funding.AccountsFile) != "" {
+		return fmt.Errorf("funding.accountsFile requires funding.accountSeed")
+	}
 	if t.Workload.RecipientPoolSize < 0 {
 		return fmt.Errorf("workload.recipientPoolSize must be >= 0")
+	}
+	if t.Workload.Workers <= 0 || t.Workload.Workers > 4096 {
+		return fmt.Errorf("workload.workers must be between 1 and 4096")
+	}
+	if t.Workload.TargetTPS < 0 || t.Workload.TargetTPS > 1_000_000_000 {
+		return fmt.Errorf("workload.targetTPS must be between 0 and 1000000000")
+	}
+	laneNames := make([]string, 0, len(t.Workload.Lanes))
+	for name := range t.Workload.Lanes {
+		laneNames = append(laneNames, name)
+	}
+	sort.Strings(laneNames)
+	for _, name := range laneNames {
+		lane := t.Workload.Lanes[name]
+		if lane.TargetInflight < 0 {
+			return fmt.Errorf("workload.lanes.%s.targetInflight must be >= 0", name)
+		}
 	}
 	for i, n := range t.Nodes {
 		if n.JSONRPC == "" {
@@ -228,10 +301,33 @@ func (t *Target) validate() error {
 	default:
 		return fmt.Errorf("unknown governance.mode %q", t.Governance.Mode)
 	}
-	if t.Funding.MasterKey == "" && t.Governance.Mode != GovPreconfigured {
-		// master key needed to fund load accounts in any active load run
-	}
 	return nil
+}
+
+func parsePositiveWholeTokensToWei(s string) (*big.Int, error) {
+	s = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(s), "+"))
+	if s == "" {
+		return nil, fmt.Errorf("funding.fundPerAccount is required")
+	}
+	if strings.HasPrefix(s, "-") {
+		return nil, fmt.Errorf("funding.fundPerAccount must not be negative")
+	}
+	intPart, fracPart, hasFrac := strings.Cut(s, ".")
+	if intPart == "" {
+		intPart = "0"
+	}
+	if intPart == "" && !hasFrac {
+		return nil, fmt.Errorf("funding.fundPerAccount is invalid")
+	}
+	if len(fracPart) > 18 {
+		fracPart = fracPart[:18]
+	}
+	fracPart += strings.Repeat("0", 18-len(fracPart))
+	wei, ok := new(big.Int).SetString(intPart+fracPart, 10)
+	if !ok {
+		return nil, fmt.Errorf("funding.fundPerAccount is invalid")
+	}
+	return wei, nil
 }
 
 // PrimaryJSONRPC returns the JSON-RPC endpoint used for sending load txs.

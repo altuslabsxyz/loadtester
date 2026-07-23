@@ -45,10 +45,15 @@ type AppHashCollector struct {
 	mu             sync.Mutex
 	res            AppHashResult
 	lastChecked    int64
+	primed         bool
 	lastHeight     int64
 	lastProgressAt time.Time
 	stallNoted     bool
 }
+
+// appHashCatchupMax bounds per-node block-header fetches per poll tick so a
+// lagging collector catches up gradually instead of stampeding the RPC.
+const appHashCatchupMax = 64
 
 // stallThreshold is how long height may stay flat before we flag a possible
 // halt. Must exceed normal block time (local chains run ~5s empty blocks) to
@@ -132,14 +137,33 @@ func (ac *AppHashCollector) poll(ctx context.Context) {
 
 	ac.detectStall(common)
 
-	start := ac.lastChecked + 1
-	if start < 1 {
-		start = 1
+	from, to, ok := ac.nextBatch(common)
+	if !ok {
+		return
 	}
-	for h := start; h <= common; h++ {
+	for h := from; h <= to; h++ {
 		ac.checkHeight(ctx, h)
 		ac.lastChecked = h
 	}
+}
+
+// nextBatch advances the cursor for the observed common height and returns
+// the inclusive height range to check this tick, capped at appHashCatchupMax.
+// The first observation primes the cursor at the CURRENT common head:
+// comparing app hashes of heights committed long before this run is
+// meaningless for the run's verdict and, on a long-lived chain, walking up
+// from height 1 never catches up. Callers guarantee common > 0.
+func (ac *AppHashCollector) nextBatch(common int64) (from, to int64, ok bool) {
+	if !ac.primed {
+		ac.primed = true
+		ac.lastChecked = common - 1
+	}
+	if ac.lastChecked >= common {
+		return 0, 0, false
+	}
+	from = ac.lastChecked + 1
+	to = min(common, ac.lastChecked+appHashCatchupMax)
+	return from, to, true
 }
 
 func (ac *AppHashCollector) detectStall(latest int64) {
