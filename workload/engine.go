@@ -22,9 +22,20 @@ package workload
 //
 // Confirmation is fed by ONE cheap RPC per block (eth_getBlockByNumber with
 // hashes only) matched against the in-flight hash index - not per-tx receipt
-// polling. A janitor probes overdue entries against the committed nonce and,
-// only after pendingTTL, re-sends the SAME nonce as a deliberate replacement
-// with fees bumped enough to satisfy the chain's replacement rule.
+// polling. Each engine runs its OWN feed against the SAME endpoint it sends
+// to. That sameness is load-bearing: distinct RPC nodes commit the same block
+// seconds apart under load (the 2026-07-23 devnet bench measured the
+// enterprise RPC node 10-90s behind the normal one), and admission is checked
+// against the receiving node's COMMITTED state. Confirming a tx through a
+// faster node's blocks and then sending nonce+1 to a slower node yields a
+// guaranteed "tx nonce is higher than account nonce" rejection per tx - the
+// 361k-error spam on that bench. A feed tied to the send endpoint makes
+// "confirmed" mean "the node I send to has committed past this tx", so the
+// follow-up send is admissible by construction and the engine self-paces to
+// each endpoint's real commit rate. A janitor probes overdue entries against
+// the committed nonce and, only after pendingTTL, re-sends the SAME nonce as a
+// deliberate replacement with fees bumped enough to satisfy the chain's
+// replacement rule.
 import (
 	"context"
 	"errors"
@@ -51,7 +62,8 @@ const (
 	defaultPendingTTL    = 90 * time.Second       // deliberate replacement after this
 	defaultMaxBumps      = 4                      // fee-bumped replacements before hard reset
 	probeBatch           = 512                    // max probes per janitor sweep (oldest first)
-	mempoolFullBackoff   = 2 * time.Second        // global send pause on chain backpressure
+	mempoolFullBackoff   = 2 * time.Second        // per-engine send pause on chain backpressure
+	defaultStaleCooldown = 500 * time.Millisecond // requeue delay when the endpoint is behind our view
 	replaceBumpNumerator = 13                     // fee bump = old * 13/10 + 1 wei
 	replaceBumpDivisor   = 10
 )
@@ -197,34 +209,45 @@ func (p *pendingTx) snapshot() (hash common.Hash, sentAt time.Time, bumps int, f
 	return p.hash, p.sentAt, p.bumps, p.feeCap, p.tip
 }
 
-// laneEngine drives ordered txs for one nonce-key over one endpoint.
+// laneEngine drives ordered txs for one nonce-key over one endpoint. Its
+// confirmation feed (head/hashes) MUST read the same endpoint send targets:
+// admission is checked against the receiving node's committed state, so a
+// confirmation signal from any other node is meaningless here (see the
+// package comment - that mismatch was the devnet error-spam bug).
 type laneEngine struct {
-	name  string
-	key   uint64
-	send  sendFn
-	probe probeFn
+	name   string
+	key    uint64
+	send   sendFn
+	probe  probeFn
+	head   headFn
+	hashes blockHashesFn
 
 	ready   chan *accounts.Account
 	pending sync.Map // common.Address -> *pendingTx
 	npend   atomic.Int64
+	hashIdx sync.Map // common.Hash -> *pendingTx (this engine's block-feed index)
+
+	backoffUntilNS atomic.Int64 // mempool-full send pause for THIS endpoint (unixnano)
 
 	// tunables (defaults above; narrowed in tests)
-	probeAfter time.Duration
-	pendingTTL time.Duration
-	maxBumps   int
+	probeAfter    time.Duration
+	pendingTTL    time.Duration
+	maxBumps      int
+	staleCooldown time.Duration
 
 	starved  atomic.Int64 // sends skipped because ready was empty
 	overflow atomic.Int64 // requeue overflow (invariant violation signal)
 	busyRace atomic.Int64 // benign janitor/worker slot overlaps (see sendOne)
 }
 
-func newLaneEngine(name string, key uint64, send sendFn, probe probeFn, accs []*accounts.Account) *laneEngine {
+func newLaneEngine(name string, key uint64, send sendFn, probe probeFn, head headFn, hashes blockHashesFn, accs []*accounts.Account) *laneEngine {
 	e := &laneEngine{
-		name: name, key: key, send: send, probe: probe,
-		ready:      make(chan *accounts.Account, len(accs)+8),
-		probeAfter: defaultProbeAfter,
-		pendingTTL: defaultPendingTTL,
-		maxBumps:   defaultMaxBumps,
+		name: name, key: key, send: send, probe: probe, head: head, hashes: hashes,
+		ready:         make(chan *accounts.Account, len(accs)+8),
+		probeAfter:    defaultProbeAfter,
+		pendingTTL:    defaultPendingTTL,
+		maxBumps:      defaultMaxBumps,
+		staleCooldown: defaultStaleCooldown,
 	}
 	for _, a := range accs {
 		e.ready <- a
@@ -241,6 +264,21 @@ func (e *laneEngine) requeue(a *accounts.Account) {
 		e.overflow.Add(1)
 		log.Printf("[load] BUG: %s ready queue overflow for %s (account dropped from rotation)", e.name, a.Addr)
 	}
+}
+
+// requeueAfter returns the account to rotation after a cooldown. Used when the
+// endpoint's committed state is BEHIND our confirmed view: an immediate requeue
+// would re-send the same future nonce into the same rejection, worker-loop
+// fast, until the node catches up (the hot spin behind the devnet error spam).
+// The account is exclusively ours here, so at most one timer exists per
+// account; a timer firing after shutdown just parks the account in a channel
+// nobody reads.
+func (e *laneEngine) requeueAfter(a *accounts.Account, d time.Duration) {
+	if d <= 0 {
+		e.requeue(a)
+		return
+	}
+	time.AfterFunc(d, func() { e.requeue(a) })
 }
 
 // ensureSeeded lazily initializes the account's nonce for this engine's key
@@ -263,7 +301,7 @@ func (e *laneEngine) park(d *Driver, a *accounts.Account, kind Kind, nonce uint6
 	e.pending.Store(a.Addr, p)
 	e.npend.Add(1)
 	if hash != (common.Hash{}) {
-		d.hashIdx.Store(hash, p)
+		e.hashIdx.Store(hash, p)
 	}
 }
 
@@ -276,7 +314,7 @@ func (e *laneEngine) finish(d *Driver, p *pendingTx, requeue bool) bool {
 	}
 	hash, _, _, _, _ := p.snapshot()
 	if hash != (common.Hash{}) {
-		d.hashIdx.Delete(hash)
+		e.hashIdx.Delete(hash)
 	}
 	e.pending.Delete(p.acc.Addr)
 	e.npend.Add(-1)
@@ -352,13 +390,22 @@ func (e *laneEngine) sendOne(ctx context.Context, d *Driver, kind Kind) bool {
 		e.park(d, a, kind, nonce, common.Hash{}, feeCap, tip)
 		d.sink.Note(OutcomeConflictParked)
 	case verdictNonceStale:
-		if n, perr := e.probe(ctx, a.Addr); perr == nil {
+		// Resync ONLY forward (an external tx consumed slots: adopt the higher
+		// committed nonce). A probe at or below our next nonce means the
+		// endpoint's committed state is BEHIND our confirmed view - never move
+		// the assign pointer backwards onto nonces that already mined, and
+		// never hot-requeue into the same rejection: cool the account down and
+		// let the endpoint catch up.
+		if n, perr := e.probe(ctx, a.Addr); perr == nil && n > a.Peek(e.key) {
 			a.SetBase(e.key, n)
+			e.requeue(a)
+			d.sink.Note(OutcomeNonceResync)
+		} else {
+			e.requeueAfter(a, e.staleCooldown)
+			d.sink.Note(OutcomeEndpointBehind)
 		}
-		e.requeue(a)
-		d.sink.Note(OutcomeNonceResync)
 	case verdictMempoolFull:
-		d.noteMempoolFull()
+		e.noteMempoolFull(d)
 		e.requeue(a)
 	case verdictBroke:
 		d.sink.Note(OutcomeRetired)
@@ -482,10 +529,10 @@ func (e *laneEngine) janitorOne(ctx context.Context, d *Driver, p *pendingTx) {
 		p.bumps = bumps + 1
 		p.mu.Unlock()
 		if oldHash != (common.Hash{}) {
-			d.hashIdx.Delete(oldHash)
+			e.hashIdx.Delete(oldHash)
 		}
 		if !p.resolved.Load() {
-			d.hashIdx.Store(tx.Hash(), p)
+			e.hashIdx.Store(tx.Hash(), p)
 		}
 		d.sink.Note(OutcomeBumped)
 	case verdictNonceStale:
@@ -502,7 +549,7 @@ func (e *laneEngine) janitorOne(ctx context.Context, d *Driver, p *pendingTx) {
 			log.Printf("[load] %s account %s out of funds - retired from rotation", e.name, p.acc.Addr)
 		}
 	case verdictMempoolFull:
-		d.noteMempoolFull()
+		e.noteMempoolFull(d)
 		p.mu.Lock()
 		p.sentAt = time.Now()
 		p.bumps = bumps + 1
@@ -525,10 +572,12 @@ type (
 	blockHashesFn func(context.Context, uint64) ([]common.Hash, error)
 )
 
-// confirmLoop is the shared per-block confirmation feed: ONE hashes-only block
-// fetch per new height, matched against the in-flight hash index of every
-// engine. It starts at the CURRENT head - historic blocks are irrelevant.
-func (d *Driver) confirmLoop(ctx context.Context, poll time.Duration, head headFn, hashes blockHashesFn) {
+// confirmLoop is this engine's per-block confirmation feed: ONE hashes-only
+// block fetch per new height on the engine's OWN endpoint, matched against its
+// in-flight hash index. It starts at the CURRENT head - historic blocks are
+// irrelevant. Reading the send endpoint's chain view (never a faster node's)
+// is what guarantees a confirmed account's next nonce is admissible there.
+func (e *laneEngine) confirmLoop(ctx context.Context, d *Driver, poll time.Duration) {
 	// Prime `last` from the FIRST successful head read, whenever that happens:
 	// defaulting to 0 after a failed startup read would walk the feed up from
 	// block 1 on a long-lived chain - silently disabling hash confirmation and
@@ -542,7 +591,7 @@ func (d *Driver) confirmLoop(ctx context.Context, poll time.Duration, head headF
 			return
 		case <-t.C:
 		}
-		h, err := head(ctx)
+		h, err := e.head(ctx)
 		if err != nil {
 			continue
 		}
@@ -553,13 +602,13 @@ func (d *Driver) confirmLoop(ctx context.Context, poll time.Duration, head headF
 			}
 		}
 		for n := 0; last < h && n < confirmCatchupMax; n++ {
-			txs, herr := hashes(ctx, last+1)
+			txs, herr := e.hashes(ctx, last+1)
 			if herr != nil {
 				break // transient: retry the same height next tick
 			}
 			last++
 			for _, hash := range txs {
-				if v, ok := d.hashIdx.LoadAndDelete(hash); ok {
+				if v, ok := e.hashIdx.LoadAndDelete(hash); ok {
 					p := v.(*pendingTx)
 					if p.engine.resolve(d, p) {
 						d.sink.Note(OutcomeConfirmed)
@@ -570,8 +619,27 @@ func (d *Driver) confirmLoop(ctx context.Context, poll time.Duration, head headF
 	}
 }
 
-// noteMempoolFull records chain backpressure and pauses all senders briefly.
-func (d *Driver) noteMempoolFull() {
-	d.backoffUntilNS.Store(time.Now().Add(mempoolFullBackoff).UnixNano())
+// noteMempoolFull records backpressure from THIS engine's endpoint and pauses
+// its senders briefly. Scoped per engine: the normal node's mempool filling up
+// says nothing about the enterprise node's admission capacity (and vice
+// versa), so one lane's backpressure must not freeze the other.
+func (e *laneEngine) noteMempoolFull(d *Driver) {
+	e.backoffUntilNS.Store(time.Now().Add(mempoolFullBackoff).UnixNano())
 	d.sink.Note(OutcomeMempoolFull)
+}
+
+// backoffWait sleeps (bounded) while this engine's mempool-full backoff is
+// active. Returns true when it consumed the caller's send slot.
+func (e *laneEngine) backoffWait(ctx context.Context) bool {
+	until := e.backoffUntilNS.Load()
+	now := time.Now().UnixNano()
+	if until <= now {
+		return false
+	}
+	dur := time.Duration(until - now)
+	if dur > 100*time.Millisecond {
+		dur = 100 * time.Millisecond
+	}
+	sleep(ctx, dur)
+	return true
 }

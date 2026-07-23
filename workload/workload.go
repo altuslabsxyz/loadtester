@@ -138,17 +138,18 @@ type KindCount struct {
 type Outcome string
 
 const (
-	OutcomeConfirmed      Outcome = "confirmed-in-block"      // resolved by the block-hash feed
-	OutcomeProbeConfirmed Outcome = "confirmed-by-probe"      // resolved by the committed-nonce probe
-	OutcomeDuplicate      Outcome = "already-known"           // node already had the identical tx
-	OutcomeConflictParked Outcome = "nonce-conflict-parked"   // slot held by an unknown tx of ours; parked
-	OutcomeNonceResync    Outcome = "nonce-resynced"          // stale nonce; resynced from committed state
-	OutcomeMempoolFull    Outcome = "mempool-full-backoff"    // chain backpressure; senders paused
-	OutcomeAmbiguous      Outcome = "ambiguous-parked"        // transport error; parked pending proof
-	OutcomeRejected       Outcome = "rejected"                // definitive rejection; slot reused
-	OutcomeBumped         Outcome = "fee-bumped-replacement"  // deliberate same-nonce replacement sent
-	OutcomeHardReset      Outcome = "hard-reset"              // slot unresolved past the escalation budget (stuck-slot signal)
-	OutcomeRetired        Outcome = "account-retired"         // insufficient funds; account dropped
+	OutcomeConfirmed      Outcome = "confirmed-in-block"       // resolved by the block-hash feed
+	OutcomeProbeConfirmed Outcome = "confirmed-by-probe"       // resolved by the committed-nonce probe
+	OutcomeDuplicate      Outcome = "already-known"            // node already had the identical tx
+	OutcomeConflictParked Outcome = "nonce-conflict-parked"    // slot held by an unknown tx of ours; parked
+	OutcomeNonceResync    Outcome = "nonce-resynced"           // stale nonce; resynced forward from committed state
+	OutcomeEndpointBehind Outcome = "endpoint-behind-cooldown" // endpoint committed state behind our view; account cooled down
+	OutcomeMempoolFull    Outcome = "mempool-full-backoff"     // endpoint backpressure; that engine's senders paused
+	OutcomeAmbiguous      Outcome = "ambiguous-parked"         // transport error; parked pending proof
+	OutcomeRejected       Outcome = "rejected"                 // definitive rejection; slot reused
+	OutcomeBumped         Outcome = "fee-bumped-replacement"   // deliberate same-nonce replacement sent
+	OutcomeHardReset      Outcome = "hard-reset"               // slot unresolved past the escalation budget (stuck-slot signal)
+	OutcomeRetired        Outcome = "account-retired"          // insufficient funds; account dropped
 )
 
 // Sink is a concurrency-safe AGGREGATE recorder of sent txs and engine
@@ -397,8 +398,10 @@ type Spec struct {
 
 // Driver schedules a large account pool through a bounded set of workers over
 // the conflict-free lane engines (see engine.go). Standard kinds and VIP each
-// get an engine with its own ready queue and pending map; unordered txs bypass
-// nonce ordering by protocol design and stay fire-and-forget.
+// get an engine with its own ready queue, pending map, hash index, confirm
+// feed, and backpressure state - all tied to the ONE endpoint that engine
+// sends to; unordered txs bypass nonce ordering by protocol design and stay
+// fire-and-forget.
 type Driver struct {
 	pool    *accounts.Pool
 	builder *Builder
@@ -412,12 +415,27 @@ type Driver struct {
 	feeCap atomic.Pointer[big.Int]
 	tip    atomic.Pointer[big.Int]
 
-	std     *laneEngine
-	vip     *laneEngine
-	hashIdx sync.Map // common.Hash -> *pendingTx (all engines; block-feed index)
+	std *laneEngine
+	vip *laneEngine
 
-	unordRR        atomic.Uint64
-	backoffUntilNS atomic.Int64 // mempool-full global send pause (unixnano)
+	unordRR atomic.Uint64
+}
+
+// blockFeed returns head/hashes closures over one endpoint for an engine's
+// confirm loop (eth_blockNumber + eth_getBlockByNumber with hashes only).
+func blockFeed(c *ethclient.Client) (headFn, blockHashesFn) {
+	rc := c.Client()
+	head := func(ctx context.Context) (uint64, error) { return c.BlockNumber(ctx) }
+	hashes := func(ctx context.Context, height uint64) ([]common.Hash, error) {
+		var blk struct {
+			Transactions []common.Hash `json:"transactions"`
+		}
+		if err := rc.CallContext(ctx, &blk, "eth_getBlockByNumber", hexutil.EncodeUint64(height), false); err != nil {
+			return nil, err
+		}
+		return blk.Transactions, nil
+	}
+	return head, hashes
 }
 
 // NewDriver creates a driver. It seeds the cached fees immediately. vipClient
@@ -501,20 +519,28 @@ func (d *Driver) RunConfigured(ctx context.Context, duration time.Duration, spec
 	if stdEnabled && len(stdAccs) == 0 {
 		log.Printf("[load] WARNING: no accounts left for standard kinds after VIP reservation (accountsN too small)")
 	}
+	stdHead, stdHashes := blockFeed(d.pool.Client)
 	d.std = newLaneEngine("std", 0,
 		d.pool.Client.SendTransaction,
 		func(ctx context.Context, addr common.Address) (uint64, error) {
 			return d.pool.Client.NonceAt(ctx, addr, nil)
 		},
+		stdHead, stdHashes,
 		stdAccs)
 	if vipEnabled {
 		vipKey := d.builder.NonceKey(KindVIP)
 		vipClient := d.vipClient
+		// The VIP feed MUST read the VIP endpoint, not the primary: the two
+		// nodes commit the same block seconds apart under load, and confirming
+		// through the faster one turns every follow-up nonce into a rejection
+		// on the slower one (see engine.go).
+		vipHead, vipHashes := blockFeed(vipClient)
 		d.vip = newLaneEngine("vip", vipKey,
 			vipClient.SendTransaction,
 			func(ctx context.Context, addr common.Address) (uint64, error) {
 				return accounts.Nonce2D(ctx, vipClient, addr, vipKey)
 			},
+			vipHead, vipHashes,
 			vipAccs)
 	}
 
@@ -536,33 +562,20 @@ func (d *Driver) RunConfigured(ctx context.Context, duration time.Duration, spec
 		}
 	}()
 
-	// Confirmation feed: ONE hashes-only block fetch per new height on the
-	// primary endpoint (VIP txs land in the same blocks). The janitors'
-	// committed-nonce probes cover anything the block view might omit.
-	rc := d.pool.Client.Client()
-	head := func(ctx context.Context) (uint64, error) { return d.pool.Client.BlockNumber(ctx) }
-	hashes := func(ctx context.Context, height uint64) ([]common.Hash, error) {
-		var blk struct {
-			Transactions []common.Hash `json:"transactions"`
-		}
-		if err := rc.CallContext(ctx, &blk, "eth_getBlockByNumber", hexutil.EncodeUint64(height), false); err != nil {
-			return nil, err
-		}
-		return blk.Transactions, nil
-	}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		d.confirmLoop(runCtx, defaultConfirmPoll, head, hashes)
-	}()
-
-	// Janitors: probe overdue in-flight txs; escalate to fee-bumped replacement.
+	// Per-engine loops: a confirmation feed reading the engine's OWN endpoint
+	// (one hashes-only block fetch per new height there - "confirmed" must mean
+	// "the node I send to has committed past this tx"), and a janitor probing
+	// overdue in-flight txs, escalating to fee-bumped replacement.
 	engines := []*laneEngine{d.std}
 	if d.vip != nil {
 		engines = append(engines, d.vip)
 	}
 	for _, e := range engines {
-		wg.Add(1)
+		wg.Add(2)
+		go func(e *laneEngine) {
+			defer wg.Done()
+			e.confirmLoop(runCtx, d, defaultConfirmPoll)
+		}(e)
 		go func(e *laneEngine) {
 			defer wg.Done()
 			t := time.NewTicker(defaultJanitorEvery)
@@ -641,12 +654,19 @@ func (d *Driver) RunConfigured(ctx context.Context, duration time.Duration, spec
 					case <-tokens:
 					}
 				}
-				if d.backoffWait(runCtx) {
-					continue // chain said "mempool full"; skip this slot
-				}
 				kind, ok := nextKind()
 				if !ok {
 					return
+				}
+				// Backpressure is per endpoint: check the engine this kind
+				// actually sends through (unordered rides the std endpoint),
+				// so one lane's "mempool full" never pauses the other lane.
+				engine := d.std
+				if kind == KindVIP && d.vip != nil {
+					engine = d.vip
+				}
+				if engine.backoffWait(runCtx) {
+					continue // that endpoint said "mempool full"; skip this slot
 				}
 				sent := false
 				switch kind {
@@ -672,22 +692,6 @@ func (d *Driver) RunConfigured(ctx context.Context, duration time.Duration, spec
 	wg.Wait()
 }
 
-// backoffWait sleeps (bounded) while a mempool-full backoff is active.
-// Returns true when it consumed the caller's send slot.
-func (d *Driver) backoffWait(ctx context.Context) bool {
-	until := d.backoffUntilNS.Load()
-	now := time.Now().UnixNano()
-	if until <= now {
-		return false
-	}
-	dur := time.Duration(until - now)
-	if dur > 100*time.Millisecond {
-		dur = 100 * time.Millisecond
-	}
-	sleep(ctx, dur)
-	return true
-}
-
 // unorderedAttempt fire-and-forgets one unordered tx (NonceKey=MaxUint64,
 // Nonce=0, unique timeout) from a rotating account. No nonce state is touched:
 // unordered txs are deduped by (sender, timeout) and cannot conflict.
@@ -706,7 +710,9 @@ func (d *Driver) unorderedAttempt(ctx context.Context) bool {
 		})
 		return true
 	case verdictMempoolFull:
-		d.noteMempoolFull()
+		// Unordered txs go over the primary endpoint - same as the std engine,
+		// whose backoff therefore carries this backpressure signal too.
+		d.std.noteMempoolFull(d)
 	}
 	return false
 }
