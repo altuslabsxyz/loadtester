@@ -34,6 +34,28 @@ type LaneViolation struct {
 	Quota    uint64
 }
 
+// BlockFill is one observed block's occupancy: the tx count and the summed tx
+// gas LIMIT (the same basis the proposer uses to fill a block, so Gas/max_gas
+// is the true blockspace utilisation, not the post-execution gasUsed).
+type BlockFill struct {
+	Height uint64 `json:"height"`
+	Txs    int    `json:"txs"`
+	Gas    uint64 `json:"gas"`
+}
+
+// FillResult answers "did every block actually fill?" - the question a
+// throughput run lives or dies by, and one PeakLaneGas alone cannot answer: a
+// single full block among many empty ones reports the same peak as a run that
+// filled every block. Counters span the whole run; Samples are bounded and are
+// what percentiles are computed from.
+type FillResult struct {
+	Blocks   int         `json:"blocks"`
+	TxsTotal uint64      `json:"txsTotal"`
+	TxsMin   int         `json:"txsMin"`
+	TxsMax   int         `json:"txsMax"`
+	Samples  []BlockFill `json:"samples"`
+}
+
 // LaneResult is the lane-attribution collector output.
 type LaneResult struct {
 	BlocksObserved int
@@ -45,10 +67,17 @@ type LaneResult struct {
 	// ViolationCount is the cumulative total (continuous-mode safe).
 	Violations     []LaneViolation
 	ViolationCount int
+	// Fill is the per-block occupancy distribution (throughput stability).
+	Fill FillResult
 }
 
 // maxLaneViolations caps retained violation samples (continuous-mode safety).
 const maxLaneViolations = 512
+
+// maxFillSamples bounds retained per-block occupancy samples (continuous-mode
+// safety). At ~1 block/s this is ~34 min of history; the running counters in
+// FillResult cover the whole run regardless.
+const maxFillSamples = 2048
 
 // LaneCollector attributes included txs to lanes and checks per-lane quota.
 type LaneCollector struct {
@@ -154,14 +183,33 @@ func (lc *LaneCollector) processBlock(ctx context.Context, height uint64) {
 	// proposal time (app/blockspace/selector.go), NOT the receipt gasUsed. Mirror
 	// that: sum tx.Gas() so the comparison against MaxGasForLane is unit-correct.
 	perLane := map[int32]uint64{}
+	blockGas := uint64(0)
 	for _, tx := range blk.Transactions() {
 		laneID := lc.classifier.PrimaryLane(tx)
 		perLane[laneID] += tx.Gas()
+		blockGas += tx.Gas()
 	}
+	nTxs := len(blk.Transactions())
 
 	lc.mu.Lock()
 	defer lc.mu.Unlock()
 	lc.res.BlocksObserved++
+
+	// Per-block occupancy. Tracked for EVERY observed block (including empty
+	// ones): the gaps are the signal when a run is meant to fill every block.
+	f := &lc.res.Fill
+	if f.Blocks == 0 || nTxs < f.TxsMin {
+		f.TxsMin = nTxs
+	}
+	if nTxs > f.TxsMax {
+		f.TxsMax = nTxs
+	}
+	f.Blocks++
+	f.TxsTotal += uint64(nTxs)
+	f.Samples = append(f.Samples, BlockFill{Height: height, Txs: nTxs, Gas: blockGas})
+	if n := len(f.Samples); n > maxFillSamples {
+		f.Samples = append(f.Samples[:0], f.Samples[n-maxFillSamples:]...)
+	}
 	for laneID, used := range perLane {
 		if used > lc.res.PeakLaneGas[laneID] {
 			lc.res.PeakLaneGas[laneID] = used
@@ -194,7 +242,9 @@ func (lc *LaneCollector) Result() LaneResult {
 		LaneNames:      map[int32]string{},
 		Violations:     append([]LaneViolation(nil), lc.res.Violations...),
 		ViolationCount: lc.res.ViolationCount,
+		Fill:           lc.res.Fill,
 	}
+	cp.Fill.Samples = append([]BlockFill(nil), lc.res.Fill.Samples...)
 	for k, v := range lc.res.PeakLaneGas {
 		cp.PeakLaneGas[k] = v
 	}

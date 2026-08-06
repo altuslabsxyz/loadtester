@@ -371,6 +371,80 @@ func Markdown(in Input) string {
 			len(in.AppHash.NodeNames), in.AppHash.HeightsChecked)
 	}
 
+	// Block fill: the throughput-stability view. A run aiming to fill every
+	// block is judged by its WORST blocks, not its best, so lead with the low
+	// percentiles - a high peak next to a low p10 is the bimodal reap-staleness
+	// signature (candidate set drained by not-yet-pruned txs), not a chain that
+	// cannot keep up.
+	if f := in.Lane.Fill; f.Blocks > 0 {
+		fmt.Fprintf(&b, "## Block fill (throughput stability)\n\n")
+		txs := make([]int, 0, len(f.Samples))
+		for _, s := range f.Samples {
+			txs = append(txs, s.Txs)
+		}
+		sort.Ints(txs)
+		pct := func(p int) int {
+			if len(txs) == 0 {
+				return 0
+			}
+			i := (p * (len(txs) - 1)) / 100
+			return txs[i]
+		}
+		mean := float64(f.TxsTotal) / float64(f.Blocks)
+		fmt.Fprintf(&b, "Blocks: %d | txs total: %d | mean %.0f tx/block\n\n", f.Blocks, f.TxsTotal, mean)
+		fmt.Fprintf(&b, "| min | p10 | p50 | p90 | max |\n|---|---|---|---|---|\n")
+		fmt.Fprintf(&b, "| %d | %d | %d | %d | %d |\n\n", f.TxsMin, pct(10), pct(50), pct(90), f.TxsMax)
+
+		// Capacity basis: gas is what the proposer fills against, so the tx
+		// ceiling is max_gas/(gas per tx) - derived from the fattest block seen
+		// rather than assumed, so it stays right for any tx shape.
+		if in.MaxBlockGas > 0 && len(f.Samples) > 0 {
+			// Derive gas-per-tx from the FATTEST block observed, not from a
+			// min/mean across all blocks: a near-empty block holding only a
+			// cheap system tx has a tiny gas/tx ratio that would collapse the
+			// divisor and inflate the ceiling into nonsense. The fullest block
+			// is by construction dominated by the load's own tx shape.
+			var fattest collector.BlockFill
+			for _, s := range f.Samples {
+				if s.Txs > fattest.Txs || (s.Txs == fattest.Txs && s.Gas > fattest.Gas) {
+					fattest = s
+				}
+			}
+			var gasPerTx uint64
+			if fattest.Txs > 0 && fattest.Gas > 0 {
+				gasPerTx = fattest.Gas / uint64(fattest.Txs)
+			}
+			if gasPerTx > 0 {
+				ceiling := in.MaxBlockGas / gasPerTx
+				atCap, near := 0, 0
+				for _, n := range txs {
+					if uint64(n) >= ceiling {
+						atCap++
+					}
+					if float64(n) >= 0.95*float64(ceiling) {
+						near++
+					}
+				}
+				fmt.Fprintf(&b, "Capacity: block.max_gas %d / %d gas per tx = **%d tx/block ceiling**. "+
+					"Blocks at ceiling: %d/%d (%.0f%%); within 95%%: %d/%d (%.0f%%). "+
+					"Mean utilisation %.0f%%.\n\n",
+					in.MaxBlockGas, gasPerTx, ceiling,
+					atCap, len(txs), 100*float64(atCap)/float64(len(txs)),
+					near, len(txs), 100*float64(near)/float64(len(txs)),
+					100*mean/float64(ceiling))
+				if near*100/max(len(txs), 1) < 90 && f.TxsMax >= int(ceiling) {
+					fmt.Fprintf(&b, "_The ceiling WAS reached (%d txs) but most blocks fell short - so the chain can "+
+						"execute a full block and the shortfall is candidate SUPPLY at proposal time. On this chain "+
+						"that is the tx-provider reap window minus already-included-but-unpruned txs: usable "+
+						"candidates are roughly `mempoolDepth - pruningLag*blockFill`, so a mempool held below "+
+						"`(1+pruningLag) x ceiling` underfills. Per-account in-flight depth is 1 here, so mempool "+
+						"depth is capped by `funding.accountsN` - raise it (and keep the tip ramp on) before "+
+						"suspecting the send path._\n\n", f.TxsMax)
+				}
+			}
+		}
+	}
+
 	// Workload summary.
 	fmt.Fprintf(&b, "## Workload summary\n\n")
 	fmt.Fprintf(&b, "| kind | count | expected lane |\n|---|---|---|\n")

@@ -55,7 +55,18 @@ import (
 
 // Engine timing/limit defaults. Overridable per laneEngine for tests.
 const (
-	defaultConfirmPoll   = 500 * time.Millisecond // block-hash feed poll cadence
+	// defaultConfirmPoll is the block-hash feed cadence. It is a direct
+	// throughput term, not just a latency nicety: an account is unusable until
+	// the feed sees its tx committed, so with per-account in-flight depth 1 the
+	// achievable rate is accountsN/releaseLatency (Little's law), and the tick
+	// contributes tick/2 on average. Measured on stable_988-1 with 7001-tx
+	// blocks, the hashes-only fetch itself costs ~207ms (473 KB), so a 500ms
+	// tick made the feed the largest controllable share of release latency and
+	// deepened the refill sawtooth after each full block - and it is the
+	// sawtooth TROUGH that sets how many non-stale candidates the proposer
+	// finds. 200ms keeps the tick well under the fetch cost while the extra
+	// head reads stay negligible (a hashes fetch happens only on a new height).
+	defaultConfirmPoll   = 200 * time.Millisecond // block-hash feed poll cadence
 	confirmCatchupMax    = 256                    // max blocks consumed per feed tick
 	defaultJanitorEvery  = 3 * time.Second        // pending-map sweep cadence
 	defaultProbeAfter    = 8 * time.Second        // probe pending entries older than this
@@ -238,6 +249,31 @@ type laneEngine struct {
 	starved  atomic.Int64 // sends skipped because ready was empty
 	overflow atomic.Int64 // requeue overflow (invariant violation signal)
 	busyRace atomic.Int64 // benign janitor/worker slot overlaps (see sendOne)
+	broke    atomic.Int64 // accounts retired out-of-funds (see noteBroke)
+}
+
+// brokeLogEvery makes out-of-funds retirement logging logarithmic. One line per
+// account turned a mispriced run into 22k identical lines that buried every
+// other signal (observed 2026-08-05), while suppressing it entirely would hide a
+// pool quietly draining. The running total is in the report as OutcomeRetired;
+// these lines exist only to make the problem visible while it happens.
+const brokeLogEvery = 500
+
+// noteBroke records an out-of-funds retirement and logs the FIRST one (with the
+// full diagnosis, since that is the actionable moment) and every Nth after.
+func (e *laneEngine) noteBroke(addr common.Address) {
+	n := e.broke.Add(1)
+	switch {
+	case n == 1:
+		log.Printf("[load] %s account %s retired: OUT OF FUNDS. The chain refuses a tx unless "+
+			"balance >= gas*feeCap, and feeCap RISES all run when tipRampWeiPerSec > 0 - so a pool sized for "+
+			"early-run prices goes bankrupt late. Every retirement shrinks the pool and with it mempool depth. "+
+			"Lower tipRampWeiPerSec/durationSec, or raise fundPerAccount and re-run --fund-only. "+
+			"Further retirements log every %d.", e.name, addr, brokeLogEvery)
+	case n%brokeLogEvery == 0:
+		log.Printf("[load] %s: %d accounts retired out-of-funds so far (pool shrinking - see the first "+
+			"out-of-funds line)", e.name, n)
+	}
 }
 
 func newLaneEngine(name string, key uint64, send sendFn, probe probeFn, head headFn, hashes blockHashesFn, accs []*accounts.Account) *laneEngine {
@@ -358,7 +394,7 @@ func (e *laneEngine) sendOne(ctx context.Context, d *Driver, kind Kind) bool {
 		return false
 	}
 	nonce := a.Peek(e.key)
-	feeCap, tip := d.feeCap.Load(), d.tip.Load()
+	feeCap, tip := d.currentFees()
 	tx, err := d.builder.build(kind, a, nonce, feeCap, tip)
 	if err != nil {
 		e.requeue(a)
@@ -409,7 +445,7 @@ func (e *laneEngine) sendOne(ctx context.Context, d *Driver, kind Kind) bool {
 		e.requeue(a)
 	case verdictBroke:
 		d.sink.Note(OutcomeRetired)
-		log.Printf("[load] %s account %s out of funds - retired from rotation", e.name, a.Addr)
+		e.noteBroke(a.Addr)
 	default: // verdictRejected
 		e.requeue(a)
 		d.sink.Note(OutcomeRejected)
@@ -508,7 +544,8 @@ func (e *laneEngine) janitorOne(ctx context.Context, d *Driver, p *pendingTx) {
 	// this re-send is cleanly rejected and re-parked; its real job there is
 	// EVICTION recovery, where the slot is empty and the re-send is a fresh
 	// insert.
-	feeCap, tip := bumpFees(oldFeeCap, oldTip, d.feeCap.Load(), d.tip.Load())
+	curFeeCap, curTip := d.currentFees()
+	feeCap, tip := bumpFees(oldFeeCap, oldTip, curFeeCap, curTip)
 	tx, err := d.builder.build(p.kind, p.acc, p.nonce, feeCap, tip)
 	if err != nil {
 		return
@@ -546,7 +583,7 @@ func (e *laneEngine) janitorOne(ctx context.Context, d *Driver, p *pendingTx) {
 	case verdictBroke:
 		if e.retire(d, p) {
 			d.sink.Note(OutcomeRetired)
-			log.Printf("[load] %s account %s out of funds - retired from rotation", e.name, p.acc.Addr)
+			e.noteBroke(p.acc.Addr)
 		}
 	case verdictMempoolFull:
 		e.noteMempoolFull(d)

@@ -415,10 +415,54 @@ type Driver struct {
 	feeCap atomic.Pointer[big.Int]
 	tip    atomic.Pointer[big.Int]
 
+	// tipRampPerSec adds a steadily rising premium to the tip so NEWER txs
+	// outrank older ones in the node's priority-ordered mempool. See
+	// SetTipRamp for why that matters. Zero disables the ramp.
+	tipRampPerSec *big.Int
+	rampStart     time.Time
+
 	std *laneEngine
 	vip *laneEngine
 
 	unordRR atomic.Uint64
+}
+
+// SetTipRamp makes each tx's tip exceed that of txs sent earlier, by
+// weiPerSec x seconds-since-start. Zero (the default) keeps a flat tip.
+//
+// Why this exists: the tx-provider serves proposers by walking its mempool with
+// SelectBy over a PriorityNonceMempool and filling a window of 2x the block gas
+// limit. Priority is the tip, and equal-tip txs tie-break FIFO - so with a flat
+// tip the window is filled from the OLDEST txs. Those are exactly the ones the
+// provider has not yet pruned after they were included, and the proposer then
+// discards them (`stale_dropped` in its classify log). Measured on this devnet:
+// of a 6000-tx reap window, 2896-5656 were stale, so blocks landed at 344-3001
+// txs instead of a steady 3000.
+//
+// A rising tip inverts that ordering so the reap window is the NEWEST txs. That
+// measurably helps: on this devnet it moved the median block from 1944 to 2992
+// txs (of a 3000-tx gas cap) and full blocks from 39% to 51%.
+//
+// It does NOT fully stabilise block fill, and the reason is worth recording. The
+// reap window is 2x the block gas limit, i.e. exactly two full blocks, while the
+// provider's pruning of just-included txs lags 1-3 blocks. So
+//
+//	fresh ~= 2*blockCap - pruningLag*blockFill
+//
+// which is a full block at lag 1 and nearly empty at lag 2 - the bimodal
+// stale_dropped values (0 / ~3000 / ~5800) seen in the proposer's classify log.
+// Closing that needs a wider reap window chain-side (reapLimitMultiplier in
+// app/txprovider/server.go), not a driver change.
+//
+// The premium is small against a 1 gwei base fee, but it grows for as long as
+// the run lasts - keep runs bounded and size fundPerAccount accordingly.
+func (d *Driver) SetTipRamp(weiPerSec int64) {
+	if weiPerSec <= 0 {
+		d.tipRampPerSec = nil
+		return
+	}
+	d.tipRampPerSec = big.NewInt(weiPerSec)
+	d.rampStart = time.Now()
 }
 
 // blockFeed returns head/hashes closures over one endpoint for an engine's
@@ -456,6 +500,24 @@ func (d *Driver) refreshFees(ctx context.Context) error {
 	d.feeCap.Store(feeCap)
 	d.tip.Store(tip)
 	return nil
+}
+
+// currentFees returns the fees to sign the NEXT tx with: the cached base fees
+// plus the freshness premium (see SetTipRamp). It is computed per tx rather than
+// per refresh tick, because the premium has to separate txs sent milliseconds
+// apart - a 5s refresh interval would lump ~12k txs into one priority band and
+// leave the FIFO tie-break, and therefore the stale-head problem, intact.
+func (d *Driver) currentFees() (feeCap, tip *big.Int) {
+	feeCap, tip = d.feeCap.Load(), d.tip.Load()
+	if d.tipRampPerSec == nil {
+		return feeCap, tip
+	}
+	// Millisecond resolution: premium = perSec * elapsedMillis / 1000.
+	ms := big.NewInt(time.Since(d.rampStart).Milliseconds())
+	premium := new(big.Int).Div(new(big.Int).Mul(d.tipRampPerSec, ms), big.NewInt(1000))
+	// feeCap must stay >= tip, and Fees() derived it from the un-ramped tip, so
+	// both move by the same amount.
+	return new(big.Int).Add(feeCap, premium), new(big.Int).Add(tip, premium)
 }
 
 // RunConfigured executes a deterministic weighted workload through at most
@@ -523,7 +585,9 @@ func (d *Driver) RunConfigured(ctx context.Context, duration time.Duration, spec
 	d.std = newLaneEngine("std", 0,
 		d.pool.Client.SendTransaction,
 		func(ctx context.Context, addr common.Address) (uint64, error) {
-			return d.pool.Client.NonceAt(ctx, addr, nil)
+			// Retried: a memiavl commit-race refusal here would look like "probe
+			// failed", leaving the slot parked until the next janitor sweep.
+			return accounts.CommittedNonceAt(ctx, d.pool.Client, addr)
 		},
 		stdHead, stdHashes,
 		stdAccs)
@@ -626,10 +690,28 @@ func (d *Driver) RunConfigured(ctx context.Context, duration time.Duration, spec
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for pacer.wait(runCtx) {
+			t := time.NewTicker(pacer.tick)
+			defer t.Stop()
+			for {
+				var now time.Time
 				select {
-				case tokens <- struct{}{}:
-				default:
+				case <-runCtx.Done():
+					return
+				case now = <-t.C:
+				}
+				// Credits that find every worker busy are DROPPED rather than
+				// queued, so the rate cap can never be banked into a later
+				// burst. All-busy means the chain's inclusion rate is the real
+				// limit, which is the signal we want to read, not smooth over.
+			batch:
+				for n := pacer.due(now); n > 0; n-- {
+					select {
+					case tokens <- struct{}{}:
+					case <-runCtx.Done():
+						return
+					default:
+						break batch
+					}
 				}
 			}
 		}()
@@ -698,7 +780,8 @@ func (d *Driver) RunConfigured(ctx context.Context, duration time.Duration, spec
 func (d *Driver) unorderedAttempt(ctx context.Context) bool {
 	accs := d.pool.Accs
 	a := accs[int(d.unordRR.Add(1))%len(accs)]
-	tx, err := d.builder.build(KindUnordered, a, 0, d.feeCap.Load(), d.tip.Load())
+	fc, tp := d.currentFees()
+	tx, err := d.builder.build(KindUnordered, a, 0, fc, tp)
 	if err != nil {
 		return false
 	}
@@ -760,43 +843,65 @@ func (p *weightedPicker) next() (Kind, bool) {
 	return p.entries[best].kind, true
 }
 
-// integerPacer emits no initial burst. Its kth deadline is
-// start+ceil(k*1s/target), so integer truncation can never exceed the cap.
+// pacerTick is the pacer's wake interval at high rates. 5ms is far below the
+// 0.685s block time, so batching credits this coarsely is invisible in any
+// per-block measurement, while cutting the wake rate at 1000 TPS from 1000/s to
+// 200/s.
+const pacerTick = 5 * time.Millisecond
+
+// integerPacer converts a target TPS into evenly spaced send credits, emitting
+// no initial burst.
+//
+// It wakes on a FIXED tick and releases the credits that have accrued since the
+// run started, rather than sleeping once per credit. One timer per credit cannot
+// hold a high rate: each time.NewTimer plus scheduler round trip costs ~0.15ms
+// on top of the requested delay, so a 1ms-per-credit loop measured only ~88% of
+// a 1000 TPS target on the driving host (and the shortfall is rate-independent -
+// ~87% at 3000 TPS). Three instances paced that way land ~2.6k tx/s instead of
+// the intended 3k.
+//
+// Credits owed are computed from ABSOLUTE elapsed time, not accumulated per
+// tick, so the pacer is self-correcting: a late wake emits exactly the backlog it
+// owes and tick jitter cannot compound into long-run drift.
 type integerPacer struct {
-	target uint64
-	baseNS uint64
-	remNS  uint64
-	carry  uint64
+	target  uint64        // credits per second
+	tick    time.Duration // wake interval
+	start   time.Time
+	emitted uint64
 }
 
 func newIntegerPacer(target int) (*integerPacer, error) {
 	if target <= 0 || target > int(time.Second) {
 		return nil, fmt.Errorf("target TPS must be between 1 and %d", time.Second)
 	}
-	t := uint64(target)
-	ns := uint64(time.Second)
-	return &integerPacer{target: t, baseNS: ns / t, remNS: ns % t, carry: t - 1}, nil
+	// At low rates one wake per credit is affordable and keeps the spacing
+	// perfectly even; only fast rates need batching.
+	tick := time.Second / time.Duration(target)
+	if tick < pacerTick {
+		tick = pacerTick
+	}
+	return &integerPacer{target: uint64(target), tick: tick}, nil
 }
 
-func (p *integerPacer) nextDelay() time.Duration {
-	delay := p.baseNS
-	p.carry += p.remNS
-	if p.carry >= p.target {
-		delay++
-		p.carry -= p.target
+// due returns how many credits are owed as of `now`, and records them as
+// emitted. The first call establishes the run's time origin, so no credit is
+// owed for time before the pacer started.
+func (p *integerPacer) due(now time.Time) uint64 {
+	if p.start.IsZero() {
+		p.start = now
+		return 0
 	}
-	return time.Duration(delay)
-}
-
-func (p *integerPacer) wait(ctx context.Context) bool {
-	t := time.NewTimer(p.nextDelay())
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-t.C:
-		return true
+	elapsed := uint64(now.Sub(p.start))
+	// Split the multiply so a long run cannot overflow: target*elapsed would
+	// exceed uint64 within the hour at the maximum allowed target (1e9).
+	const ns = uint64(time.Second)
+	want := p.target*(elapsed/ns) + p.target*(elapsed%ns)/ns
+	if want <= p.emitted {
+		return 0
 	}
+	n := want - p.emitted
+	p.emitted = want
+	return n
 }
 
 // sleep waits d or until ctx is done; returns true if ctx ended.

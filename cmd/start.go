@@ -15,6 +15,7 @@ var (
 	flagDeployment string
 	flagOut        string
 	flagFailOn     string
+	flagFundOnly   bool
 )
 
 var startCmd = &cobra.Command{
@@ -26,7 +27,7 @@ var startCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		defer stop()
-		return harness.Run(ctx, flagTarget, flagDeployment, flagOut, flagFailOn)
+		return harness.Run(ctx, flagTarget, flagDeployment, flagOut, flagFailOn, flagFundOnly)
 	},
 }
 
@@ -35,5 +36,9 @@ func init() {
 	startCmd.Flags().StringVarP(&flagDeployment, "deployment", "d", "deployment.json", "deployment JSON (from the TS deployer)")
 	startCmd.Flags().StringVarP(&flagOut, "out", "o", "out", "report output directory")
 	startCmd.Flags().StringVar(&flagFailOn, "fail-on", "none", "exit non-zero when the overall verdict meets this threshold: none|fail|review (one-shot only)")
+	startCmd.Flags().BoolVar(&flagFundOnly, "fund-only", false,
+		"fund the account pool and exit without sending load. Run this for EVERY target first "+
+			"when launching instances in parallel: otherwise the instance that finishes funding "+
+			"first drives load that starves the others' funding txs past their receipt deadline")
 	rootCmd.AddCommand(startCmd)
 }

@@ -44,7 +44,15 @@ func initSDKConfig() {
 // Run executes the whole flow and writes a report into outDir. failOn is the
 // CI exit-code threshold ("none"|"fail"|"review") applied to the final one-shot
 // verdict; continuous runs (verdict LIVE) never trip it.
-func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string) error {
+//
+// With fundOnly set it stops after the account pool is funded and sends no load.
+// That exists because funding competes with load for block space: when several
+// instances are launched together, whichever finishes funding first starts
+// driving load, and a straggler's funding txs then miss the receipt deadline
+// ("tx not mined within 1m0s"). Funding every pool first, then launching the
+// instances, removes the race - and for a seeded pool the second pass is nearly
+// free, since already-funded accounts need no transfer.
+func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string, fundOnly bool) error {
 	initSDKConfig()
 	runStart := time.Now() // log-scan ignores files older than this (stale prior-run logs)
 
@@ -80,6 +88,10 @@ func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string)
 		return fmt.Errorf("fund accounts: %w", err)
 	}
 	log.Printf("[setup] accounts funded")
+	if fundOnly {
+		log.Printf("[setup] --fund-only: pool of %d accounts is funded; sending no load", len(pool.Accs))
+		return nil
+	}
 
 	var plan *laneplan.Plan
 	if len(tgt.Blockspace.Lanes) > 0 {
@@ -272,6 +284,20 @@ func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string)
 	if err != nil {
 		return fmt.Errorf("driver: %w", err)
 	}
+	if r := tgt.Workload.TipRampWeiPerSec; r > 0 {
+		driver.SetTipRamp(r)
+		log.Printf("[load] tip ramp: +%d wei/s so fresh txs outrank stale ones in the provider's reap window", r)
+	}
+
+	// Affordability preflight. The tip ramp is unbounded, so a run can be priced
+	// out mid-flight: the chain then refuses txs per account ("insufficient
+	// funds"), the engine retires each one, the pool shrinks, and mempool depth -
+	// the very thing a fill-every-block run depends on - collapses. That failure
+	// is silent until it is total, so check it here where it is still a config
+	// problem rather than 20k rejections into a wasted run.
+	if err := preflightSpend(ctx, tgt, pool); err != nil {
+		return err
+	}
 	if tgt.Workload.Continuous() {
 		reportEvery := time.Duration(tgt.Observe.ReportIntervalSec) * time.Second
 		if reportEvery <= 0 {
@@ -432,6 +458,51 @@ func buildSpecs(tgt *config.Target, builder *workload.Builder) []workload.Spec {
 		specs = append(specs, workload.Spec{Kind: kind, Inflight: load.TargetInflight})
 	}
 	return specs
+}
+
+// preflightSpend refuses to start a run the account pool cannot pay for.
+//
+// It prices txs at targetTPS (the send-rate CAP, not the rate the chain will
+// actually reach), so the projection errs high and a PASS is meaningful. In
+// continuous mode there is no bounded cost - the ramp grows for as long as the
+// run lasts - so the only honest thing to do is say so.
+func preflightSpend(ctx context.Context, tgt *config.Target, pool *accounts.Pool) error {
+	ramp := tgt.Workload.TipRampWeiPerSec
+	if tgt.Workload.Continuous() {
+		if ramp > 0 {
+			log.Printf("[load] WARNING: continuous mode with tipRampWeiPerSec=%d - the ramp is UNBOUNDED, so "+
+				"per-tx cost grows without limit and accounts WILL eventually be retired as out-of-funds. "+
+				"Use a bounded durationSec, or set tipRampWeiPerSec: 0 for an open-ended run.", ramp)
+		}
+		return nil
+	}
+	feeCap, tip, err := pool.Fees(ctx)
+	if err != nil {
+		return fmt.Errorf("preflight fees: %w", err)
+	}
+	est, ok := workload.EstimateSpend(feeCap, tip, ramp,
+		tgt.Workload.DurationSec, tgt.Workload.TargetTPS, len(pool.Accs), 21000)
+	if !ok {
+		return nil // not estimable (e.g. uncapped targetTPS); nothing to assert
+	}
+	minBal, err := pool.MinBalance(ctx)
+	if err != nil {
+		log.Printf("[load] WARNING: could not read pool balances for the spend preflight: %v", err)
+		return nil
+	}
+	affordable, detail := workload.CheckAffordable(est, minBal)
+	if affordable {
+		log.Printf("[load] spend preflight OK: %s", detail)
+		return nil
+	}
+	return fmt.Errorf("spend preflight FAILED: %s\n"+
+		"  This run would bankrupt accounts mid-flight; each one is then retired, the pool shrinks, and\n"+
+		"  mempool depth (what fill-every-block depends on) collapses. Pick one:\n"+
+		"    - lower workload.tipRampWeiPerSec (biggest lever: cost is ~gas x ramp x durationSec/2, and the\n"+
+		"      ramp only needs to ORDER txs, so a much smaller slope works)\n"+
+		"    - lower workload.durationSec or workload.targetTPS\n"+
+		"    - raise funding.fundPerAccount (watch the nonlinear endowment cascade) and re-run --fund-only",
+		detail)
 }
 
 func firstCometRPC(tgt *config.Target) string {

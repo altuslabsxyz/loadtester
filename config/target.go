@@ -119,6 +119,16 @@ type Workload struct {
 	Workers int `yaml:"workers"`
 	// TargetTPS is the optional aggregate send-rate cap. 0 means uncapped.
 	TargetTPS int `yaml:"targetTPS"`
+	// TipRampWeiPerSec adds a steadily rising premium to each tx's tip so newer
+	// txs outrank older ones in the node's priority-ordered mempool. 0 (default)
+	// keeps a flat tip. See workload.Driver.SetTipRamp for the full rationale:
+	// the tx-provider fills its reap window from the highest-priority txs, and a
+	// flat tip makes that window the OLDEST txs - the ones already included but
+	// not yet pruned, which the proposer then discards as stale.
+	//
+	// The premium grows without bound over a run, so keep runs bounded (or the
+	// value small): at 1e8 (0.1 gwei/s) a 150s run ends ~15 gwei above base.
+	TipRampWeiPerSec int64 `yaml:"tipRampWeiPerSec"`
 	// RecipientPoolSize controls shared-recipient contention for transfer workloads.
 	//   0 (default): one deterministic recipient per sender, for parallel-capacity tests.
 	//   1:           one shared hot recipient, reproducing the legacy contention test.
@@ -271,6 +281,9 @@ func (t *Target) validate() error {
 	}
 	if t.Workload.TargetTPS < 0 || t.Workload.TargetTPS > 1_000_000_000 {
 		return fmt.Errorf("workload.targetTPS must be between 0 and 1000000000")
+	}
+	if t.Workload.TipRampWeiPerSec < 0 {
+		return fmt.Errorf("workload.tipRampWeiPerSec must be >= 0")
 	}
 	laneNames := make([]string, 0, len(t.Workload.Lanes))
 	for name := range t.Workload.Lanes {

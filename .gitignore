@@ -2,7 +2,30 @@
 /loader
 /bin/
 target.yaml
+target.yaml.*
+target*.bak
 out/
+# Derived account-pool manifest (funding.accountsFile): secret-free but large
+# (~1MB per 1k accounts) and fully regenerable from the accountSeed. Ignored by
+# default to prevent accidental multi-MB commits; `git add -f` if you truly
+# want a pinned copy in the repo.
+accounts/load-pool.json
+*-pool.json
+*-pool_*.json
 deployment.json
 *.log
 .DS_Store
+
+# Per-instance / experiment target configs. These carry a funding.masterKey
+# PRIVATE KEY and a secret accountSeed, so they must never be committed -
+# target.example.yaml is the template to copy. (Note: target.local.yaml is
+# already tracked and DOES contain a key; rotate it if that account is real.)
+target[0-9]*.yaml
+experiments/*.yaml
+
+# Run outputs: report.json / report.md written per run via -o.
+out*/
+runlogs/
+
+# oh-my-claudecode session state.
+.omc/

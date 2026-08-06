@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -112,6 +113,13 @@ type Pool struct {
 	Signer  types.Signer
 	Master  *Account
 	Accs    []*Account
+
+	// lastStates caches the most recent loadAccountStates result. Fund ends by
+	// re-reading every account, so a caller that only needs post-funding
+	// balances (the spend preflight) can reuse that instead of paying for
+	// another 2-RPC-per-account sweep of the whole pool.
+	statesMu   sync.Mutex
+	lastStates []accountChainState
 }
 
 // PoolOptions controls optional account-pool persistence. Empty options keep
@@ -126,9 +134,217 @@ const (
 	accountDeriveDomain = "loadtester/account-derivation/v1"
 	accountFingerDomain = "loadtester/account-fingerprint/v1"
 	manifestVersion     = 1
-	fundingWorkers      = 32
-	sweepWorkers        = 32
+	// fundingWorkers bounds concurrent balance/nonce reads and receipt polls
+	// during funding. These are read-only RPCs, never the serialized-broadcast
+	// hazard, so the old value of 32 bought nothing: a 36000-account pool is
+	// 72000 state reads per pass and loadAccountStates runs twice per Fund, so
+	// 32 workers cost ~45s of pure waiting. 128 cuts that to ~11s and is still
+	// far below what the load phase puts on the same endpoint.
+	fundingWorkers = 128
+	sweepWorkers   = 32
+	// fundingBroadcastWorkers bounds CONCURRENT funding broadcasts within one
+	// round (see sendFundingBatch). Broadcasts, not receipts, dominate a funding
+	// pass: 21000 transfers at ~10ms each is ~3.5 minutes serial and ~1.6s here.
+	// 128 is well under the concurrency the load phase itself puts on the same
+	// endpoint (workload.workers is 512-1536), so it adds no new peak load.
+	fundingBroadcastWorkers = 128
+	// queryRetryAttempts/queryRetryBase bound the retry of a transient state
+	// read (linear backoff: 150ms, 300ms, ... ~5.4s total).
+	queryRetryAttempts = 8
+	queryRetryBase     = 150 * time.Millisecond
 )
+
+// isTransientQueryErr reports whether a failed state READ can succeed on retry.
+//
+// The chain advances CometBFT's `latest height` at commit time, but the memiavl
+// version for that height only becomes queryable a moment later. A state query
+// landing inside that window is refused outright:
+//
+//	failed to load state at height 33247821; historical version not ready:
+//	33247821: invalid height (latest height: 33247821)
+//
+// That is a commit race, not a real error - the identical query succeeds
+// milliseconds later. Setup reads 2 values per account (balance + nonce), so at
+// accountsN in the thousands hitting the window is near-certain, and a single
+// unretried hit used to abort the entire run in the funding phase.
+//
+// Transport-level failures are included: the read never reached a verdict, and
+// reads are idempotent so replaying one is always safe. Definitive rejections
+// (bad address, unknown method) do not match and still fail fast.
+func isTransientQueryErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	// The CALLER's deadline/cancellation - retrying cannot help and would only
+	// mask shutdown.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, s := range []string{
+		// memiavl / versiondb commit race
+		"historical version not ready",
+		"failed to load state at height",
+		"invalid height",
+		"version does not exist",
+		"proof queries at height",
+		// node briefly out of capacity or restarting
+		"resource exhausted", "unavailable", "server is not up",
+		// transport: request may never have been evaluated
+		"connection reset", "connection refused", "broken pipe",
+		"unexpected eof", "eof", "i/o timeout", "timeout awaiting",
+		"too many open files", "no such host", "server misbehaving",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// retryQuery runs an idempotent chain read, retrying transient failures with a
+// bounded linear backoff. Every state read in this tool should go through it: a
+// bare client call is one memiavl commit race away from aborting a run.
+func retryQuery[T any](ctx context.Context, fn func(context.Context) (T, error)) (T, error) {
+	var zero T
+	var err error
+	for i := 1; i <= queryRetryAttempts; i++ {
+		var v T
+		if v, err = fn(ctx); err == nil {
+			return v, nil
+		}
+		if !isTransientQueryErr(err) || i == queryRetryAttempts {
+			return zero, err
+		}
+		select {
+		case <-ctx.Done():
+			return zero, ctx.Err()
+		case <-time.After(time.Duration(i) * queryRetryBase):
+		}
+	}
+	return zero, err
+}
+
+// PendingNonceAt reads the account's next nonce, retrying the commit race.
+func PendingNonceAt(ctx context.Context, c *ethclient.Client, addr common.Address) (uint64, error) {
+	return retryQuery(ctx, func(ctx context.Context) (uint64, error) {
+		return c.PendingNonceAt(ctx, addr)
+	})
+}
+
+// CommittedNonceAt reads the account's nonce at the latest COMMITTED block,
+// retrying the commit race. This is the engine's admission probe.
+func CommittedNonceAt(ctx context.Context, c *ethclient.Client, addr common.Address) (uint64, error) {
+	return retryQuery(ctx, func(ctx context.Context) (uint64, error) {
+		return c.NonceAt(ctx, addr, nil)
+	})
+}
+
+// BalanceAt reads the account's native balance, retrying the commit race.
+func BalanceAt(ctx context.Context, c *ethclient.Client, addr common.Address) (*big.Int, error) {
+	return retryQuery(ctx, func(ctx context.Context) (*big.Int, error) {
+		return c.BalanceAt(ctx, addr, nil)
+	})
+}
+
+// isNonceMismatchErr reports whether a broadcast was refused because the tx's
+// nonce does not match the sender's account nonce. Resending the SAME signed
+// bytes can never fix this - the nonce must be re-read and the tx re-signed.
+//
+// The stable ante surfaces these verbatim through eth_sendRawTransaction, e.g.
+// "got 58, expected 59: txnonce is lower than account nonce".
+func isNonceMismatchErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, s := range []string{
+		"nonce is lower than account nonce", "nonce is higher than account nonce",
+		"nonce too low", "nonce too high", "nonce gap", "invalid nonce",
+		"invalid sequence", "sequence mismatch", "account sequence mismatch",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// isAlreadyKnownErr reports whether the node already holds this exact tx, which
+// means an earlier (possibly ambiguous) attempt was admitted - a success.
+func isAlreadyKnownErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, s := range []string{
+		"already known", "already in mempool", "already exists in cache", "known transaction",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// isSlotOccupiedErr reports whether a DIFFERENT tx already holds this
+// (sender, nonce) in the node's app-side mempool and ours did not out-bid it.
+//
+//	tx doesn't fit the replacement rule, oldPriority: 125, newPriority: 125
+//
+// Seen when a previous run's load tx survives in the app mempool after CometBFT's
+// CList has already drained to 0: the slot stays blocked, so a funding tx priced
+// identically (both derive fees from the same base fee) is refused every time.
+// The only way through is to price strictly above the resident tx.
+func isSlotOccupiedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, s := range []string{
+		"replacement rule", "replacement transaction", "oldpriority",
+		"underpriced", "fee too low",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// errSlotWedged marks a (sender, nonce) slot that this chain cannot free.
+//
+// The error text advertises a priority comparison ("oldPriority: 125,
+// newPriority: 784"), which reads like an RBF rule that a fee bump could beat.
+// It cannot: app/mempool.go sets TxReplacement to a function that
+// unconditionally returns false, so replacement is disabled outright and the
+// priorities in the message are cosmetic. A re-send at 6x the tip is refused
+// exactly like one at par (measured).
+//
+// The resident tx can therefore only leave by being included or evicted. When it
+// is stuck in the app-side mempool while CometBFT's CList already reports zero
+// unconfirmed txs, nothing will ever move it, and that account's nonce is
+// wedged until the node restarts. Funding must route around such an account
+// rather than abort a 6000-account pass over one of them.
+var errSlotWedged = errors.New("nonce slot held by a stale tx and replacement is disabled chain-side")
+
+// errSenderBroke marks a funding-tree sender that cannot pay for its transfer.
+//
+// A tree sender is only ever broke because its OWN top-up was skipped earlier in
+// the pass (see errSlotWedged): the schedule is precomputed, so a receiver that
+// never got funded is still scheduled to fund others in later rounds. Aborting
+// there would turn one wedged account into a failed run on a fresh pool, so this
+// is skipped and counted exactly like a wedged slot.
+var errSenderBroke = errors.New("funding-tree sender has insufficient funds (its own top-up was skipped)")
+
+// isBrokeErr reports whether a broadcast was refused for lack of funds.
+func isBrokeErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "insufficient funds") || strings.Contains(msg, "insufficient balance")
+}
 
 // parseKey accepts a hex private key with or without 0x.
 func parseKey(hexKey string) (*ecdsa.PrivateKey, error) {
@@ -391,7 +607,7 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 }
 
 func (p *Pool) seedNonce(ctx context.Context, a *Account) error {
-	n, err := p.Client.PendingNonceAt(ctx, a.Addr)
+	n, err := PendingNonceAt(ctx, p.Client, a.Addr)
 	if err != nil {
 		return fmt.Errorf("pending nonce for %s: %w", a.Addr, err)
 	}
@@ -402,7 +618,9 @@ func (p *Pool) seedNonce(ctx context.Context, a *Account) error {
 // Fees returns (gasFeeCap, gasTipCap) from the current base fee. Callers on the
 // hot path should fetch once and reuse, passing the values to the Sign* helpers.
 func (p *Pool) Fees(ctx context.Context) (*big.Int, *big.Int, error) {
-	head, err := p.Client.HeaderByNumber(ctx, nil)
+	head, err := retryQuery(ctx, func(ctx context.Context) (*types.Header, error) {
+		return p.Client.HeaderByNumber(ctx, nil)
+	})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -550,12 +768,12 @@ func (p *Pool) loadAccountStates(ctx context.Context, workers int) ([]accountCha
 			defer wg.Done()
 			for i := range jobs {
 				a := p.Accs[i]
-				bal, err := p.Client.BalanceAt(ctx, a.Addr, nil)
+				bal, err := BalanceAt(ctx, p.Client, a.Addr)
 				if err != nil {
 					errCh <- fmt.Errorf("read balance for %s: %w", a.Addr, err)
 					continue
 				}
-				nonce, err := p.Client.PendingNonceAt(ctx, a.Addr)
+				nonce, err := PendingNonceAt(ctx, p.Client, a.Addr)
 				if err != nil {
 					errCh <- fmt.Errorf("pending nonce for %s: %w", a.Addr, err)
 					continue
@@ -582,6 +800,9 @@ func (p *Pool) loadAccountStates(ctx context.Context, workers int) ([]accountCha
 			return nil, err
 		}
 	}
+	p.statesMu.Lock()
+	p.lastStates = states
+	p.statesMu.Unlock()
 	return states, nil
 }
 
@@ -662,7 +883,7 @@ func (p *Pool) Fund(ctx context.Context, amountWholeTokens string) error {
 	// can't cover all root transfers plus gas would otherwise fund an arbitrary
 	// prefix of accounts and then fail mid-stream (or time out waiting), leaving
 	// the rest unfunded. Fail fast with a clear, actionable message instead.
-	bal, err := p.Client.BalanceAt(ctx, p.Master.Addr, nil)
+	bal, err := BalanceAt(ctx, p.Client, p.Master.Addr)
 	if err != nil {
 		return fmt.Errorf("read master balance: %w", err)
 	}
@@ -687,41 +908,57 @@ func (p *Pool) Fund(ctx context.Context, amountWholeTokens string) error {
 	// path (x/auth "index uniqueness constrain violation", recovered panic, tx
 	// rejected). A broadcast is ~milliseconds, so serializing them costs almost
 	// nothing; the round still mines in ~one block.
-	funded := 0
+	// A wedged sender (errSlotWedged) costs its receiver a top-up but must not
+	// abort the pass: an underfunded account simply retires from the load
+	// rotation later. A HIGH skip count is different - that means something
+	// systemic, so it still fails loudly rather than silently under-funding.
+	maxWedged := len(p.Accs) / 100 // 1%
+	if maxWedged < 8 {
+		maxWedged = 8
+	}
+	// An account that is already present in the chain's auth store cannot be
+	// CREATED by its funding tx, so that tx cannot hit the concurrent-creation
+	// race described on sendFundingBatch - it is safe to broadcast in parallel.
+	// This is what makes a re-fund fast: every account of a previously funded
+	// pool already exists, so the whole pass parallelises.
+	exists := make([]bool, len(p.Accs))
+	for i, st := range states {
+		exists[i] = st.nonce > 0 || (st.balance != nil && st.balance.Sign() > 0)
+	}
+
+	funded, wedged := 0, 0
 	for ri, round := range rounds {
-		txs := make([]sentFundingTx, 0, len(round))
-		for _, fp := range round {
-			if endow[fp.receiver].Sign() == 0 {
-				continue
-			}
-			sender := p.Master
-			if fp.sender >= 0 {
-				sender = p.Accs[fp.sender]
-			}
-			recv := p.Accs[fp.receiver]
-			tx := types.NewTx(&types.DynamicFeeTx{
-				ChainID:   p.ChainID,
-				Nonce:     sender.Next(0),
-				GasTipCap: tip,
-				GasFeeCap: feeCap,
-				Gas:       21000,
-				To:        &recv.Addr,
-				Value:     endow[fp.receiver],
-			})
-			signed, err := types.SignTx(tx, p.Signer, sender.Key)
-			if err != nil {
-				return fmt.Errorf("sign funding tx for %s: %w", recv.Addr, err)
-			}
-			if err := p.sendWithRetry(ctx, signed); err != nil {
-				return fmt.Errorf("send funding tx to %s: %w", recv.Addr, err)
-			}
-			txs = append(txs, sentFundingTx{hash: signed.Hash(), addr: recv.Addr})
+		concurrent, serial := partitionRound(round, endow, exists)
+		if len(concurrent) == 0 && len(serial) == 0 {
+			continue // no-op round (common: a grown seeded pool skips every early round)
+		}
+
+		txs, w, err := p.sendFundingBatch(ctx, concurrent, endow, feeCap, tip, fundingBroadcastWorkers)
+		wedged += w
+		if err != nil {
+			return err
+		}
+		stxs, sw, err := p.sendFundingBatch(ctx, serial, endow, feeCap, tip, 1)
+		wedged += sw
+		if err != nil {
+			return err
+		}
+		txs = append(txs, stxs...)
+		if wedged > maxWedged {
+			return fmt.Errorf("%d funding senders unusable (limit %d) - wedged nonce slots in the "+
+				"chain's app mempool, or their own top-ups were skipped; restart the target node "+
+				"to clear stale mempool entries", wedged, maxWedged)
 		}
 		if err := p.waitFundingReceipts(ctx, txs, 60*time.Second, fundingWorkers); err != nil {
 			return err
 		}
 		funded += len(txs)
-		log.Printf("[fund] round %d/%d mined: %d top-up txs sent (%d/%d total)", ri+1, len(rounds), len(txs), funded, len(p.Accs))
+		log.Printf("[fund] round %d/%d mined: %d top-up txs (%d parallel, %d serial-new-account) (%d/%d total)",
+			ri+1, len(rounds), len(txs), len(concurrent), len(serial), funded, len(p.Accs))
+	}
+	if wedged > 0 {
+		log.Printf("[fund] %d/%d accounts left without a top-up (wedged sender nonce slots); "+
+			"they will retire from the load rotation if underfunded", wedged, len(p.Accs))
 	}
 
 	// Re-seed every account's nonce from chain: tree senders consumed nonces.
@@ -749,6 +986,41 @@ func sweepAmount(bal, gasReserve *big.Int) *big.Int {
 // cover its own sweep gas, or whose send/mine fails, is skipped and logged; the
 // total amount recovered (in wei) is returned. A fixed-size worker pool bounds
 // balance/receipt RPC concurrency even when the reusable account pool is large.
+// MinBalance returns the balance of the POOREST account in the pool, which is
+// the account that decides whether a run survives: the ready-queue rotation is
+// only roughly fair, so the weakest account is bankrupted first and every
+// retirement concentrates more txs onto the survivors. A mean would hide exactly
+// the tail that matters - a pool split between richly-funded reused accounts and
+// thinly-funded new ones (the common case for a grown seeded pool) has a healthy
+// mean and a fatal minimum.
+func (p *Pool) MinBalance(ctx context.Context) (*big.Int, error) {
+	// Fund ends by re-reading every account, so in the normal start-up order the
+	// balances are already in hand and re-reading them would add a second
+	// 2-RPC-per-account sweep of the pool for no new information.
+	p.statesMu.Lock()
+	states := p.lastStates
+	p.statesMu.Unlock()
+	if len(states) != len(p.Accs) {
+		var err error
+		if states, err = p.loadAccountStates(ctx, fundingWorkers); err != nil {
+			return nil, err
+		}
+	}
+	var min *big.Int
+	for _, st := range states {
+		if st.balance == nil {
+			continue
+		}
+		if min == nil || st.balance.Cmp(min) < 0 {
+			min = st.balance
+		}
+	}
+	if min == nil {
+		return nil, fmt.Errorf("no account balances read")
+	}
+	return min, nil
+}
+
 func (p *Pool) Sweep(ctx context.Context) (*big.Int, error) {
 	feeCap, tip, err := p.Fees(ctx)
 	if err != nil {
@@ -781,7 +1053,7 @@ func (p *Pool) Sweep(ctx context.Context) (*big.Int, error) {
 					skipped++
 					mu.Unlock()
 				}
-				bal, err := p.Client.BalanceAt(ctx, a.Addr, nil)
+				bal, err := BalanceAt(ctx, p.Client, a.Addr)
 				if err != nil {
 					skip("balance read failed for %s: %v (skipped)", a.Addr, err)
 					continue
@@ -793,7 +1065,7 @@ func (p *Pool) Sweep(ctx context.Context) (*big.Int, error) {
 					mu.Unlock()
 					continue
 				}
-				nonce, err := p.Client.PendingNonceAt(ctx, a.Addr)
+				nonce, err := PendingNonceAt(ctx, p.Client, a.Addr)
 				if err != nil {
 					skip("nonce read failed for %s: %v (skipped)", a.Addr, err)
 					continue
@@ -838,6 +1110,187 @@ func (p *Pool) Sweep(ctx context.Context) (*big.Int, error) {
 	log.Printf("[sweep] recovered %s wei to master from %d/%d accounts (%d skipped)",
 		recovered, swept, len(p.Accs), skipped)
 	return recovered, nil
+}
+
+// partitionRound splits one funding round into the pairs that may be broadcast
+// CONCURRENTLY and the pairs that must be broadcast SERIALLY, dropping any pair
+// with nothing to send.
+//
+// The rule is a safety invariant, not a heuristic: a funding tx to an account
+// that is not yet in the chain's auth store CREATES it, and two such creations
+// executing concurrently panic the node in the fee path (x/auth "index
+// uniqueness constrain violation"). A receiver that already exists cannot be
+// created again, so its transfer is free of that hazard. Getting this backwards
+// does not slow a run down, it panics CheckTx on the node under test - so keep
+// the default on the safe side: anything not known to exist goes serial.
+func partitionRound(round []fundPair, endow []*big.Int, exists []bool) (concurrent, serial []fundPair) {
+	for _, fp := range round {
+		if fp.receiver >= len(endow) || endow[fp.receiver] == nil || endow[fp.receiver].Sign() == 0 {
+			continue // already holds enough; nothing to send
+		}
+		if fp.receiver < len(exists) && exists[fp.receiver] {
+			concurrent = append(concurrent, fp)
+		} else {
+			serial = append(serial, fp)
+		}
+	}
+	return concurrent, serial
+}
+
+// sendFundingBatch broadcasts one round's transfers at the given concurrency and
+// returns the sent txs plus the number skipped for wedged/broke senders.
+//
+// Concurrency is safe here for a specific, narrow reason. Within a round every
+// pair has a DISTINCT sender, so the chain's 1-in-flight-per-sender rule is
+// never violated and no two goroutines touch the same Account. What forced this
+// to be serial was a different hazard: two CheckTx executions racing to CREATE a
+// not-yet-existing account panic the node in the fee path (x/auth "index
+// uniqueness constrain violation" - see Fund). That race needs an account
+// CREATION, so callers pass workers>1 only for receivers already present in the
+// auth store, and workers=1 for the rest.
+//
+// Why it matters: broadcasts dominate a funding pass. Topping a 36000-account
+// pool up from 15000 funded is 21000 transfers, which at ~10ms each is ~3.5
+// minutes serial and ~1.6s at 128 concurrency.
+//
+// Unlike the serial version this does not abort mid-round on the wedged limit;
+// the caller checks the running total once the round completes. A round is
+// bounded work, and the limit is a health signal rather than a safety stop.
+func (p *Pool) sendFundingBatch(ctx context.Context, pairs []fundPair, endow []*big.Int, feeCap, tip *big.Int, workers int) ([]sentFundingTx, int, error) {
+	if len(pairs) == 0 {
+		return nil, 0, nil
+	}
+	workers = boundedWorkers(len(pairs), workers)
+
+	var (
+		mu      sync.Mutex
+		txs     []sentFundingTx
+		wedged  int
+		hardErr error
+	)
+	jobs := make(chan fundPair)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for fp := range jobs {
+				mu.Lock()
+				stop := hardErr != nil
+				mu.Unlock()
+				if stop || ctx.Err() != nil {
+					continue // drain: a peer already failed hard
+				}
+				sender := p.Master
+				if fp.sender >= 0 {
+					sender = p.Accs[fp.sender]
+				}
+				recv := p.Accs[fp.receiver]
+				hash, err := p.sendFundingTx(ctx, sender, recv.Addr, endow[fp.receiver], feeCap, tip)
+				mu.Lock()
+				switch {
+				case errors.Is(err, errSlotWedged) || errors.Is(err, errSenderBroke):
+					wedged++
+					log.Printf("[fund] WARNING: skipping top-up of %s: %v (%d skipped)", recv.Addr, err, wedged)
+				case err != nil:
+					if hardErr == nil {
+						hardErr = fmt.Errorf("send funding tx to %s: %w", recv.Addr, err)
+					}
+				default:
+					txs = append(txs, sentFundingTx{hash: hash, addr: recv.Addr})
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	for _, fp := range pairs {
+		jobs <- fp
+	}
+	close(jobs)
+	wg.Wait()
+	return txs, wedged, hardErr
+}
+
+// sendFundingTx broadcasts ONE funding transfer and returns its hash, resyncing
+// the sender's nonce whenever chain state has moved past our local view.
+//
+// sendWithRetry cannot do this job: it replays the same signed bytes, and a tx
+// whose nonce is already consumed is rejected identically on every attempt.
+// Nonces drift out from under us for several ordinary reasons -
+//
+//   - another loadtester process shares this master key (the classic one: three
+//     targets pointing at three RPC nodes but all naming the same funding key,
+//     which produced "got 58, expected 59: txnonce is lower than account nonce")
+//   - an earlier funding pass aborted after broadcasting but before we recorded it
+//   - the nonce was seeded from an endpoint whose committed state lagged
+//
+// so the recovery is always the same: re-read the COMMITTED nonce, re-sign at
+// that nonce, and send again. Committed (not pending) is the right basis - this
+// chain admits only nonce == committed nonce, with no future-nonce queue.
+func (p *Pool) sendFundingTx(ctx context.Context, sender *Account, to common.Address, value, feeCap, tip *big.Int) (common.Hash, error) {
+	const attempts = 8
+	var lastErr error
+	for i := 1; i <= attempts; i++ {
+		nonce := sender.Peek(0)
+		signed, err := types.SignTx(types.NewTx(&types.DynamicFeeTx{
+			ChainID:   p.ChainID,
+			Nonce:     nonce,
+			GasTipCap: tip,
+			GasFeeCap: feeCap,
+			Gas:       21000,
+			To:        &to,
+			Value:     value,
+		}), p.Signer, sender.Key)
+		if err != nil {
+			return common.Hash{}, fmt.Errorf("sign funding tx: %w", err)
+		}
+		err = p.Client.SendTransaction(ctx, signed)
+		if err == nil || isAlreadyKnownErr(err) {
+			sender.SetBase(0, nonce+1) // only a landed broadcast consumes the nonce
+			return signed.Hash(), nil
+		}
+		lastErr = err
+		switch {
+		case isNonceMismatchErr(err):
+			// Adopt chain's view and re-sign. Do NOT fall back to the local
+			// nonce on a failed read - that would resend into the same wall.
+			n, qerr := CommittedNonceAt(ctx, p.Client, sender.Addr)
+			if qerr != nil {
+				return common.Hash{}, fmt.Errorf("resync nonce for %s after %v: %w", sender.Addr, err, qerr)
+			}
+			log.Printf("[fund] %s nonce resync %d -> %d (%v)", sender.Addr, nonce, n, err)
+			sender.SetBase(0, n)
+		case isSlotOccupiedErr(err):
+			// A stale tx (typically a previous run's load tx) holds this slot.
+			// If chain state has since moved past it, re-sign at the new nonce;
+			// otherwise the slot is unrecoverable here (see errSlotWedged) and
+			// the caller must skip this transfer.
+			n, qerr := CommittedNonceAt(ctx, p.Client, sender.Addr)
+			if qerr != nil {
+				return common.Hash{}, fmt.Errorf("resync nonce for %s after %v: %w", sender.Addr, err, qerr)
+			}
+			if n > nonce {
+				sender.SetBase(0, n)
+				break
+			}
+			return common.Hash{}, fmt.Errorf("%s nonce %d: %w", sender.Addr, nonce, errSlotWedged)
+		case isBrokeErr(err):
+			return common.Hash{}, fmt.Errorf("%s: %w", sender.Addr, errSenderBroke)
+		case isTransientQueryErr(err):
+			// Node-side race or transport flake: the same nonce is still ours.
+		default:
+			return common.Hash{}, err // definitive rejection
+		}
+		if i == attempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return common.Hash{}, ctx.Err()
+		case <-time.After(time.Duration(i) * 400 * time.Millisecond):
+		}
+	}
+	return common.Hash{}, lastErr
 }
 
 // sendWithRetry broadcasts a signed tx, retrying transient rejections with a
