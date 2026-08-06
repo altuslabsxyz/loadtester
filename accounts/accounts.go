@@ -134,20 +134,8 @@ const (
 	accountDeriveDomain = "loadtester/account-derivation/v1"
 	accountFingerDomain = "loadtester/account-fingerprint/v1"
 	manifestVersion     = 1
-	// fundingWorkers bounds concurrent balance/nonce reads and receipt polls
-	// during funding. These are read-only RPCs, never the serialized-broadcast
-	// hazard, so the old value of 32 bought nothing: a 36000-account pool is
-	// 72000 state reads per pass and loadAccountStates runs twice per Fund, so
-	// 32 workers cost ~45s of pure waiting. 128 cuts that to ~11s and is still
-	// far below what the load phase puts on the same endpoint.
-	fundingWorkers = 128
-	sweepWorkers   = 32
-	// fundingBroadcastWorkers bounds CONCURRENT funding broadcasts within one
-	// round (see sendFundingBatch). Broadcasts, not receipts, dominate a funding
-	// pass: 21000 transfers at ~10ms each is ~3.5 minutes serial and ~1.6s here.
-	// 128 is well under the concurrency the load phase itself puts on the same
-	// endpoint (workload.workers is 512-1536), so it adds no new peak load.
-	fundingBroadcastWorkers = 128
+	fundingWorkers      = 32
+	sweepWorkers        = 32
 	// queryRetryAttempts/queryRetryBase bound the retry of a transient state
 	// read (linear backoff: 150ms, 300ms, ... ~5.4s total).
 	queryRetryAttempts = 8
@@ -809,7 +797,6 @@ func (p *Pool) loadAccountStates(ctx context.Context, workers int) ([]accountCha
 type sentFundingTx struct {
 	hash common.Hash
 	addr common.Address
-	idx  int // receiver's pool index; -1 when not applicable
 }
 
 func (p *Pool) waitFundingReceipts(ctx context.Context, txs []sentFundingTx, timeout time.Duration, workers int) error {
@@ -917,53 +904,39 @@ func (p *Pool) Fund(ctx context.Context, amountWholeTokens string) error {
 	if maxWedged < 8 {
 		maxWedged = 8
 	}
-	// senderExists tracks which accounts are present in the chain's auth store
-	// and may therefore PAY for a funding tx concurrently (see partitionRound:
-	// the ante creates the fee payer, so it is the sender that races, not the
-	// account being funded). Seeded from chain state, then extended each round:
-	// a receiver whose funding tx has MINED has been created by that block's
-	// execution, so it is a valid concurrent sender from the next round on.
-	senderExists := make([]bool, len(p.Accs))
-	for i, st := range states {
-		senderExists[i] = st.nonce > 0 || (st.balance != nil && st.balance.Sign() > 0)
-	}
-
 	funded, wedged := 0, 0
 	for ri, round := range rounds {
-		concurrent, serial := partitionRound(round, endow, senderExists)
-		if len(concurrent) == 0 && len(serial) == 0 {
-			continue // no-op round (common: a grown seeded pool skips every early round)
-		}
-
-		txs, w, err := p.sendFundingBatch(ctx, concurrent, endow, feeCap, tip, fundingBroadcastWorkers)
-		wedged += w
-		if err != nil {
-			return err
-		}
-		stxs, sw, err := p.sendFundingBatch(ctx, serial, endow, feeCap, tip, 1)
-		wedged += sw
-		if err != nil {
-			return err
-		}
-		txs = append(txs, stxs...)
-		if wedged > maxWedged {
-			return fmt.Errorf("%d funding senders unusable (limit %d) - wedged nonce slots in the "+
-				"chain's app mempool, or their own top-ups were skipped; restart the target node "+
-				"to clear stale mempool entries", wedged, maxWedged)
+		txs := make([]sentFundingTx, 0, len(round))
+		for _, fp := range round {
+			if endow[fp.receiver].Sign() == 0 {
+				continue
+			}
+			sender := p.Master
+			if fp.sender >= 0 {
+				sender = p.Accs[fp.sender]
+			}
+			recv := p.Accs[fp.receiver]
+			hash, err := p.sendFundingTx(ctx, sender, recv.Addr, endow[fp.receiver], feeCap, tip)
+			if errors.Is(err, errSlotWedged) || errors.Is(err, errSenderBroke) {
+				wedged++
+				log.Printf("[fund] WARNING: skipping top-up of %s: %v (%d skipped)", recv.Addr, err, wedged)
+				if wedged > maxWedged {
+					return fmt.Errorf("%d funding senders unusable (limit %d) - wedged nonce slots in the "+
+						"chain's app mempool, or their own top-ups were skipped; restart the target node "+
+						"to clear stale mempool entries: %w", wedged, maxWedged, err)
+				}
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("send funding tx to %s: %w", recv.Addr, err)
+			}
+			txs = append(txs, sentFundingTx{hash: hash, addr: recv.Addr})
 		}
 		if err := p.waitFundingReceipts(ctx, txs, 60*time.Second, fundingWorkers); err != nil {
 			return err
 		}
-		// Mined => the block's execution created these accounts, so each is a
-		// valid concurrent fee payer for the rounds that follow.
-		for _, s := range txs {
-			if s.idx >= 0 && s.idx < len(senderExists) {
-				senderExists[s.idx] = true
-			}
-		}
 		funded += len(txs)
-		log.Printf("[fund] round %d/%d mined: %d top-up txs (%d parallel, %d serial-new-sender) (%d/%d total)",
-			ri+1, len(rounds), len(txs), len(concurrent), len(serial), funded, len(p.Accs))
+		log.Printf("[fund] round %d/%d mined: %d top-up txs sent (%d/%d total)", ri+1, len(rounds), len(txs), funded, len(p.Accs))
 	}
 	if wedged > 0 {
 		log.Printf("[fund] %d/%d accounts left without a top-up (wedged sender nonce slots); "+
@@ -1119,124 +1092,6 @@ func (p *Pool) Sweep(ctx context.Context) (*big.Int, error) {
 	log.Printf("[sweep] recovered %s wei to master from %d/%d accounts (%d skipped)",
 		recovered, swept, len(p.Accs), skipped)
 	return recovered, nil
-}
-
-// partitionRound splits one funding round into the pairs that may be broadcast
-// CONCURRENTLY and the pairs that must be broadcast SERIALLY, dropping any pair
-// with nothing to send.
-//
-// The rule is a safety invariant, not a heuristic, and it turns on the SENDER -
-// not, as one might assume, the account being funded. CheckTx runs only the
-// ante, and the ante creates the account it charges fees to:
-//
-//	// stable-evm ante/evm/06_account_verification.go
-//	if account == nil {
-//	    acc := accountKeeper.NewAccountWithAddress(ctx, from.Bytes())  // from = SENDER
-//	    accountKeeper.SetAccount(ctx, acc)
-//	}
-//
-// Two such creations running concurrently take the same next account number and
-// trip the unique index on it (cosmossdk.io/collections/indexes/unique.go:60,
-// "index uniqueness constrain violation"), which surfaces as a recovered panic
-// and a rejected tx. The RECEIVER is not touched by CheckTx at all - it is
-// created when the block executes - so funding a brand-new account is safe to
-// broadcast concurrently as long as the account PAYING for it already exists.
-//
-// In the fan-out every sender is either the master or an account funded in an
-// already-committed earlier round, so senders exist by construction and a whole
-// pass can run concurrently, including the first fund of a fresh seed. The
-// exception this still guards is a sender whose own top-up was skipped (wedged):
-// it does not exist, its ante would try to create it, and it must go serial.
-//
-// Getting this backwards does not merely slow a run down, it panics CheckTx on
-// the node under test - so anything not KNOWN to exist goes serial.
-func partitionRound(round []fundPair, endow []*big.Int, senderExists []bool) (concurrent, serial []fundPair) {
-	for _, fp := range round {
-		if fp.receiver >= len(endow) || endow[fp.receiver] == nil || endow[fp.receiver].Sign() == 0 {
-			continue // already holds enough; nothing to send
-		}
-		// sender -1 is the master, which necessarily exists (it just paid for
-		// the pre-flight reads and holds the pool's whole float).
-		ok := fp.sender < 0 || (fp.sender < len(senderExists) && senderExists[fp.sender])
-		if ok {
-			concurrent = append(concurrent, fp)
-		} else {
-			serial = append(serial, fp)
-		}
-	}
-	return concurrent, serial
-}
-
-// sendFundingBatch broadcasts one round's transfers at the given concurrency and
-// returns the sent txs plus the number skipped for wedged/broke senders.
-//
-// Concurrency is safe here for a specific, narrow reason. Within a round every
-// pair has a DISTINCT sender, so the chain's 1-in-flight-per-sender rule is
-// never violated and no two goroutines touch the same Account. The remaining
-// hazard is two CheckTx executions racing to CREATE the account they charge fees
-// to, which trips the account-number unique index; partitionRound decides which
-// pairs are free of it, and callers pass workers>1 only for those.
-//
-// Why it matters: broadcasts dominate a funding pass. Funding 36000 accounts is
-// 36000 transfers, which at ~10ms each is ~6 minutes serial and ~2.8s at 128
-// concurrency.
-//
-// Unlike the serial version this does not abort mid-round on the wedged limit;
-// the caller checks the running total once the round completes. A round is
-// bounded work, and the limit is a health signal rather than a safety stop.
-func (p *Pool) sendFundingBatch(ctx context.Context, pairs []fundPair, endow []*big.Int, feeCap, tip *big.Int, workers int) ([]sentFundingTx, int, error) {
-	if len(pairs) == 0 {
-		return nil, 0, nil
-	}
-	workers = boundedWorkers(len(pairs), workers)
-
-	var (
-		mu      sync.Mutex
-		txs     []sentFundingTx
-		wedged  int
-		hardErr error
-	)
-	jobs := make(chan fundPair)
-	var wg sync.WaitGroup
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for fp := range jobs {
-				mu.Lock()
-				stop := hardErr != nil
-				mu.Unlock()
-				if stop || ctx.Err() != nil {
-					continue // drain: a peer already failed hard
-				}
-				sender := p.Master
-				if fp.sender >= 0 {
-					sender = p.Accs[fp.sender]
-				}
-				recv := p.Accs[fp.receiver]
-				hash, err := p.sendFundingTx(ctx, sender, recv.Addr, endow[fp.receiver], feeCap, tip)
-				mu.Lock()
-				switch {
-				case errors.Is(err, errSlotWedged) || errors.Is(err, errSenderBroke):
-					wedged++
-					log.Printf("[fund] WARNING: skipping top-up of %s: %v (%d skipped)", recv.Addr, err, wedged)
-				case err != nil:
-					if hardErr == nil {
-						hardErr = fmt.Errorf("send funding tx to %s: %w", recv.Addr, err)
-					}
-				default:
-					txs = append(txs, sentFundingTx{hash: hash, addr: recv.Addr, idx: fp.receiver})
-				}
-				mu.Unlock()
-			}
-		}()
-	}
-	for _, fp := range pairs {
-		jobs <- fp
-	}
-	close(jobs)
-	wg.Wait()
-	return txs, wedged, hardErr
 }
 
 // sendFundingTx broadcasts ONE funding transfer and returns its hash, resyncing
