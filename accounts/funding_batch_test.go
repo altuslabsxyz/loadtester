@@ -7,21 +7,65 @@ import (
 
 func wei(n int64) *big.Int { return big.NewInt(n) }
 
-// TestPartitionRoundKeepsAccountCreationsSerial pins the safety invariant: a
-// transfer to an account that does not yet exist on chain CREATES it, and two
-// concurrent creations panic the node's CheckTx in the fee path. Only receivers
-// already present in the auth store may be broadcast concurrently.
-func TestPartitionRoundKeepsAccountCreationsSerial(t *testing.T) {
+// TestPartitionRoundGatesOnSenderNotReceiver pins the safety invariant and the
+// non-obvious half of it: CheckTx runs only the ante, and the ante creates the
+// account it charges FEES to (stable-evm ante/evm/06_account_verification.go
+// creates `from`). So it is the SENDER that can race two concurrent creations
+// into the account-number unique index; the receiver is created later, by block
+// execution. Funding a brand-new account is therefore safe to broadcast
+// concurrently provided the payer already exists.
+func TestPartitionRoundGatesOnSenderNotReceiver(t *testing.T) {
 	endow := []*big.Int{wei(1), wei(1), wei(1), wei(1)}
-	exists := []bool{true, false, true, false}
-	round := []fundPair{{-1, 0}, {0, 1}, {1, 2}, {2, 3}}
+	// Senders 0 and 2 exist; 1 and 3 do not. Receiver existence is irrelevant.
+	senderExists := []bool{true, false, true, false}
+	round := []fundPair{{0, 1}, {1, 2}, {2, 3}}
 
-	conc, ser := partitionRound(round, endow, exists)
-	if len(conc) != 2 || conc[0].receiver != 0 || conc[1].receiver != 2 {
-		t.Errorf("concurrent = %v, want receivers [0 2]", conc)
+	conc, ser := partitionRound(round, endow, senderExists)
+	if len(conc) != 2 || conc[0].sender != 0 || conc[1].sender != 2 {
+		t.Errorf("concurrent = %v, want senders [0 2]", conc)
 	}
-	if len(ser) != 2 || ser[0].receiver != 1 || ser[1].receiver != 3 {
-		t.Errorf("serial = %v, want receivers [1 3]", ser)
+	if len(ser) != 1 || ser[0].sender != 1 {
+		t.Errorf("serial = %v, want sender [1]", ser)
+	}
+}
+
+// TestPartitionRoundMasterIsAlwaysConcurrent covers sender -1: the master holds
+// the pool's float and has necessarily transacted, so it never needs the serial
+// path. Without this the very first round of every pass would be serialized for
+// no reason.
+func TestPartitionRoundMasterIsAlwaysConcurrent(t *testing.T) {
+	conc, ser := partitionRound([]fundPair{{-1, 0}}, []*big.Int{wei(1)}, nil /* nothing known */)
+	if len(conc) != 1 || len(ser) != 0 {
+		t.Errorf("master pair: concurrent=%v serial=%v, want it concurrent", conc, ser)
+	}
+}
+
+// TestPartitionRoundFreshSeedIsFullyConcurrent is the case the old
+// receiver-based gate got wrong: on the first fund of a brand-new seed NO
+// receiver exists, yet every sender is either the master or an account funded in
+// an already-committed round, so the whole round may go concurrently. The old
+// rule reported "0 parallel" here and serialized 36,000 broadcasts.
+func TestPartitionRoundFreshSeedIsFullyConcurrent(t *testing.T) {
+	const n = 64
+	endow := make([]*big.Int, n)
+	for i := range endow {
+		endow[i] = wei(1)
+	}
+	senderExists := make([]bool, n) // nothing exists yet
+	var round []fundPair
+	// Mirror the tree: senders are the master plus already-funded accounts.
+	for i := 0; i < 8; i++ {
+		senderExists[i] = true
+		round = append(round, fundPair{sender: i, receiver: 8 + i})
+	}
+	round = append(round, fundPair{sender: -1, receiver: 63})
+
+	conc, ser := partitionRound(round, endow, senderExists)
+	if len(ser) != 0 {
+		t.Errorf("serial = %v, want none: every payer exists", ser)
+	}
+	if len(conc) != 9 {
+		t.Errorf("concurrent = %d pairs, want 9", len(conc))
 	}
 }
 
@@ -30,8 +74,8 @@ func TestPartitionRoundKeepsAccountCreationsSerial(t *testing.T) {
 // rounds of a grown seeded pool collapse to no-ops.
 func TestPartitionRoundDropsZeroEndowments(t *testing.T) {
 	endow := []*big.Int{wei(0), wei(0), wei(5)}
-	exists := []bool{true, true, true}
-	conc, ser := partitionRound([]fundPair{{-1, 0}, {0, 1}, {1, 2}}, endow, exists)
+	senderExists := []bool{true, true, true}
+	conc, ser := partitionRound([]fundPair{{-1, 0}, {0, 1}, {1, 2}}, endow, senderExists)
 	if len(ser) != 0 {
 		t.Errorf("serial = %v, want empty", ser)
 	}
@@ -40,18 +84,18 @@ func TestPartitionRoundDropsZeroEndowments(t *testing.T) {
 	}
 }
 
-// TestPartitionRoundDefaultsToSerial guards the fail-safe direction: an unknown
-// receiver (missing from the exists slice, e.g. a shorter state read) must be
-// treated as a creation, because guessing wrong panics the node rather than
-// merely slowing the pass.
+// TestPartitionRoundDefaultsToSerial guards the fail-safe direction: a sender
+// not KNOWN to exist (e.g. one whose own top-up was skipped as wedged) must go
+// serial, because guessing wrong panics the node rather than merely slowing the
+// pass.
 func TestPartitionRoundDefaultsToSerial(t *testing.T) {
 	endow := []*big.Int{wei(1), wei(1)}
-	conc, ser := partitionRound([]fundPair{{-1, 0}, {0, 1}}, endow, nil /* nothing known */)
+	conc, ser := partitionRound([]fundPair{{0, 1}}, endow, nil /* nothing known */)
 	if len(conc) != 0 {
-		t.Errorf("concurrent = %v, want empty when existence is unknown", conc)
+		t.Errorf("concurrent = %v, want empty when the payer is unknown", conc)
 	}
-	if len(ser) != 2 {
-		t.Errorf("serial = %v, want both pairs", ser)
+	if len(ser) != 1 {
+		t.Errorf("serial = %v, want the pair", ser)
 	}
 }
 
