@@ -134,3 +134,84 @@ func MaxBlockGas(ctx context.Context, cometRPC string) (uint64, error) {
 	}
 	return uint64(g), nil
 }
+
+// CommittedTxCounter accumulates the number of transactions the chain has
+// COMMITTED, read from a node that is caught up (a validator).
+//
+// The load driver needs this to know its FRESH supply - the txs it has sent
+// that are not yet in any block - which is the only part of a mempool the tx
+// provider can actually serve. Depth alone conflates fresh txs with ones the
+// validators already committed and the provider node has not pruned yet,
+// and those two behave completely differently: the stale part is invisible to
+// the proposer until it is pruned, and then becomes servable all at once.
+type CommittedTxCounter struct {
+	cometRPC string
+	last     int64  // highest height already counted
+	total    uint64 // cumulative txs over counted heights
+}
+
+func NewCommittedTxCounter(cometRPC string) *CommittedTxCounter {
+	return &CommittedTxCounter{cometRPC: cometRPC}
+}
+
+// blockchainMeta is the subset of /blockchain this needs.
+type blockchainMeta struct {
+	LastHeight string `json:"last_height"`
+	BlockMetas []struct {
+		NumTxs string `json:"num_txs"`
+		Header struct {
+			Height string `json:"height"`
+		} `json:"header"`
+	} `json:"block_metas"`
+}
+
+// Total advances the counter to the chain head and returns the cumulative
+// committed tx count. The first call establishes the baseline and returns 0.
+//
+// /blockchain serves at most 20 metas per call, so a caller that falls far
+// behind is caught up over several calls rather than in one huge fetch.
+func (c *CommittedTxCounter) Total(ctx context.Context) (uint64, error) {
+	var r blockchainMeta
+	if err := cometGet(ctx, c.cometRPC, "blockchain", nil, &r); err != nil {
+		return c.total, err
+	}
+	head, err := strconv.ParseInt(r.LastHeight, 10, 64)
+	if err != nil || head <= 0 {
+		return c.total, fmt.Errorf("blockchain: bad last_height %q", r.LastHeight)
+	}
+	if c.last == 0 { // baseline: count from here on, not from genesis
+		c.last = head
+		return 0, nil
+	}
+	if head <= c.last {
+		return c.total, nil
+	}
+	// Walk forward in 20-height pages until the head is reached.
+	for c.last < head {
+		lo, hi := c.last+1, c.last+20
+		if hi > head {
+			hi = head
+		}
+		var page blockchainMeta
+		q := map[string]string{
+			"minHeight": strconv.FormatInt(lo, 10),
+			"maxHeight": strconv.FormatInt(hi, 10),
+		}
+		if err := cometGet(ctx, c.cometRPC, "blockchain", q, &page); err != nil {
+			return c.total, err
+		}
+		if len(page.BlockMetas) == 0 {
+			break
+		}
+		for _, m := range page.BlockMetas {
+			h, herr := strconv.ParseInt(m.Header.Height, 10, 64)
+			if herr != nil || h <= c.last {
+				continue
+			}
+			n, _ := strconv.ParseUint(m.NumTxs, 10, 64)
+			c.total += n
+		}
+		c.last = hi
+	}
+	return c.total, nil
+}

@@ -421,6 +421,28 @@ type Driver struct {
 	tipRampPerSec *big.Int
 	rampStart     time.Time
 
+	// perAccountInflight is the max concurrent in-flight ordered txs per
+	// account per nonce-key. Zero means DefaultPerAccountInflight.
+	perAccountInflight int
+
+	// maxInflight caps total in-flight txs per engine. Zero means no cap beyond
+	// accountsN*perAccountInflight.
+	maxInflight int
+
+	// feedClient reads committed block CONTENTS for the confirm loops. nil
+	// means read them from the send endpoint. See blockFeed.
+	feedClient *ethclient.Client
+
+	// mempoolDepth reads the send endpoint's current mempool depth. When set
+	// together with targetMempoolDepth, the driver runs closed-loop on it.
+	mempoolDepth       func(context.Context) (int, error)
+	targetMempoolDepth int
+
+	// committedTxs reads the CHAIN's cumulative committed tx count from a
+	// caught-up node. With it the controller regulates fresh supply instead of
+	// raw depth. See SetFreshSupplyController.
+	committedTxs func(context.Context) (uint64, error)
+
 	std *laneEngine
 	vip *laneEngine
 
@@ -456,6 +478,184 @@ type Driver struct {
 //
 // The premium is small against a 1 gwei base fee, but it grows for as long as
 // the run lasts - keep runs bounded and size fundPerAccount accordingly.
+// DefaultPerAccountInflight is the per-account in-flight depth used when the
+// target does not set one.
+//
+// It is 1, and the measurement that settled that is worth recording, because
+// the naive expectation is the opposite. Depth > 1 does lift the in-flight
+// ceiling off accountsN - that part works, and engine.go documents how - but on
+// stable_988-1 it made throughput WORSE, not better:
+//
+//	depth 1, 25,000 accounts:  4,019 tx/s sustained, 38% empty blocks
+//	depth 2, 25,000 accounts:  2,486 tx/s sustained, 66% empty blocks
+//	                           (both capped at 25,000 in flight, same run
+//	                            conditions, 2026-08-14)
+//
+// The cause is sender diversity. A fixed in-flight budget spread over depth D
+// occupies accountsN/D distinct senders, and one sender's txs are nonce-ordered,
+// so they cannot execute in parallel with each other. At depth 1 the same 25,000
+// txs come from 25,000 independent senders and block-STM can schedule all of
+// them; at depth 2 only 12,500 senders are involved. The chain's rate WHILE
+// SERVING dropped from 5,885 to 4,902 tx/s accordingly.
+//
+// So raise this only when the account pool cannot be grown - depth is how you
+// reach a given in-flight level with fewer accounts, at a real cost in execution
+// parallelism. Growing accountsN is strictly better when it is affordable.
+const DefaultPerAccountInflight = 1
+
+// maxPerAccountInflight bounds the configurable depth. Past a few dozen, an
+// account's run of unmined nonces spans more blocks than the app's selective
+// recheck re-admits after each Commit, so the tail just collects
+// "nonce is higher than account nonce" retries instead of adding throughput.
+const maxPerAccountInflight = 64
+
+// SetPerAccountInflight sets how many ordered txs one account may have in the
+// mempool at once, per nonce-key. Values below 1 select the default; values
+// above maxPerAccountInflight are clamped. Must be called before RunConfigured.
+func (d *Driver) SetPerAccountInflight(n int) {
+	switch {
+	case n <= 0:
+		d.perAccountInflight = DefaultPerAccountInflight
+	case n > maxPerAccountInflight:
+		log.Printf("[load] perAccountInflight %d exceeds the %d cap; clamping", n, maxPerAccountInflight)
+		d.perAccountInflight = maxPerAccountInflight
+	default:
+		d.perAccountInflight = n
+	}
+}
+
+// SetBlockFeedClient points the confirm loops' block-CONTENTS reads at a node
+// other than the send endpoint. Account release still waits on the send
+// endpoint's own head. nil keeps both reads on the send endpoint.
+//
+// Call ValidateBlockFeed first. A node that does not run the EVM tx indexer
+// answers eth_getBlockByNumber with a DIFFERENT (or empty) transaction list,
+// and the resulting feed matches nothing at all.
+func (d *Driver) SetBlockFeedClient(c *ethclient.Client) { d.feedClient = c }
+
+// ValidateBlockFeed reports whether contents can stand in for sendClient as the
+// source of committed block CONTENTS.
+//
+// This check exists because getting it wrong is silent and total. A committed
+// block's transaction list is consensus-agreed, so it is tempting to read it
+// from any node - but eth_getBlockByNumber reports ETHEREUM tx hashes, and on
+// this chain those come from the EVM tx indexer (app.toml [json-rpc]
+// enable-indexer). A node with the indexer off still answers the call, just
+// with a list the engine's hash index can never match: measured on
+// stable_988-1, pointing the feed at a validator (indexer off) took
+// confirmed-in-block to ZERO, left every account waiting on the slow janitor
+// probe, and cut a 120s run from ~500,000 txs to 43,944 - with no error
+// anywhere. So prove the two endpoints agree on a real block before trusting
+// the cheaper one.
+func ValidateBlockFeed(ctx context.Context, sendClient, contents *ethclient.Client) error {
+	if contents == nil {
+		return nil
+	}
+	head, err := sendClient.BlockNumber(ctx)
+	if err != nil {
+		return fmt.Errorf("send endpoint head: %w", err)
+	}
+	sendHead, sendHashes := blockFeed(sendClient, nil)
+	_ = sendHead
+	feedHead, feedHashes := blockFeed(sendClient, contents)
+	_ = feedHead
+
+	// Walk back for a block that actually carries txs; an empty block proves
+	// nothing, and a chain that has been idle may have a long run of them.
+	const lookback = 200
+	for i := uint64(0); i < lookback && i < head; i++ {
+		h := head - i
+		want, werr := sendHashes(ctx, h)
+		if werr != nil || len(want) == 0 {
+			continue
+		}
+		got, gerr := feedHashes(ctx, h)
+		if gerr != nil {
+			return fmt.Errorf("block-feed endpoint failed on height %d: %w", h, gerr)
+		}
+		set := make(map[common.Hash]struct{}, len(want))
+		for _, x := range want {
+			set[x] = struct{}{}
+		}
+		matched := 0
+		for _, x := range got {
+			if _, ok := set[x]; ok {
+				matched++
+			}
+		}
+		if matched != len(want) {
+			return fmt.Errorf("block-feed endpoint disagrees on height %d: it reports %d tx hashes, "+
+				"%d of which match the send endpoint's %d (a node with the EVM tx indexer disabled "+
+				"reports different hashes)", h, len(got), matched, len(want))
+		}
+		return nil
+	}
+	return fmt.Errorf("no non-empty block in the last %d heights to validate the block feed against", lookback)
+}
+
+// mempoolPoll is how often the closed-loop controller re-reads the send
+// endpoint's mempool depth. It bounds the controller's overshoot: between
+// observations the driver may send at most (rate x poll) txs past the setpoint,
+// so 100ms at 20k tx/s is a ~2,000-tx overshoot on a setpoint of 12,000. The
+// query itself is CometBFT num_unconfirmed_txs, which returns counts only (no tx
+// bodies) and measured 24ms against a loaded node - negligible next to the
+// thousands of sends per second already in flight to it.
+const mempoolPoll = 100 * time.Millisecond
+
+// SetMempoolDepthController makes the driver hold the send endpoint's mempool at
+// `target` transactions, measured rather than inferred.
+//
+// This is the difference between a driver that refills a drained mempool within
+// one poll and one that waits for its own confirmations to catch up. The
+// proposer takes the whole mempool into a block, so depth goes to zero every
+// time it proposes; an in-flight budget keyed on unconfirmed txs stays saturated
+// for seconds afterwards (the send endpoint confirms well behind the validators)
+// and the accounts that could refill immediately are held back. Reading the real
+// depth removes that lag from the loop entirely.
+//
+// probe may be nil, and target <= 0 disables the controller.
+func (d *Driver) SetMempoolDepthController(target int, probe func(context.Context) (int, error)) {
+	d.targetMempoolDepth = target
+	d.mempoolDepth = probe
+}
+
+// SetFreshSupplyController switches the controller's measured variable from raw
+// mempool depth to FRESH SUPPLY: transactions the driver has sent that no block
+// contains yet.
+//
+// Depth is the wrong variable, and the difference is not subtle. The send
+// endpoint's mempool holds two populations: txs no block has taken (which the
+// provider can serve) and txs the validators already committed but this node has
+// not pruned, because it executes a block a beat after they do. The provider
+// correctly skips the second group - so a mempool of 40,000 can yield a proposer
+// nothing at all. Then the node catches up, the stale group is pruned in one go,
+// the whole remainder becomes servable, and a single block takes 37,670 txs.
+// Measured on stable_988-1: holding DEPTH at 40,000 produced runs of seven empty
+// blocks followed by one 37,670-tx block, and 44% of blocks were empty.
+//
+// Fresh supply has no such hidden population. `sent - committed` is exactly what
+// the next proposer can be given, so holding it at N makes blocks of about N.
+// The committed count must come from a node that is caught up (a validator);
+// reading it from the send endpoint would reintroduce the very lag being
+// corrected for.
+func (d *Driver) SetFreshSupplyController(target int, committed func(context.Context) (uint64, error)) {
+	d.targetMempoolDepth = target
+	d.committedTxs = committed
+}
+
+// SetMaxInflight caps total in-flight txs per engine. 0 removes the cap. Must
+// be called before RunConfigured. See config.Workload.MaxInflight for why a
+// deliberately shallow backlog produces steadier blocks than a full mempool.
+func (d *Driver) SetMaxInflight(n int) { d.maxInflight = n }
+
+// inflightDepth returns the configured depth, defaulted.
+func (d *Driver) inflightDepth() int {
+	if d.perAccountInflight <= 0 {
+		return DefaultPerAccountInflight
+	}
+	return d.perAccountInflight
+}
+
 func (d *Driver) SetTipRamp(weiPerSec int64) {
 	if weiPerSec <= 0 {
 		d.tipRampPerSec = nil
@@ -465,11 +665,23 @@ func (d *Driver) SetTipRamp(weiPerSec int64) {
 	d.rampStart = time.Now()
 }
 
-// blockFeed returns head/hashes closures over one endpoint for an engine's
-// confirm loop (eth_blockNumber + eth_getBlockByNumber with hashes only).
-func blockFeed(c *ethclient.Client) (headFn, blockHashesFn) {
+// blockFeed returns head/hashes closures for an engine's confirm loop
+// (eth_blockNumber + eth_getBlockByNumber with hashes only).
+//
+// head MUST read the send endpoint: "confirmed" has to mean "the node I send to
+// has committed past this tx", or the follow-up nonce is refused there. contents
+// may be ANY node that has committed the height, because a committed block's
+// transaction list is agreed by consensus - and it should be a different node
+// when one is available, since the contents read is orders of magnitude more
+// expensive than the head read (see config.Target.BlockFeedJSONRPC). Passing nil
+// for contents reads both from the send endpoint.
+func blockFeed(sendClient, contents *ethclient.Client) (headFn, blockHashesFn) {
+	c := sendClient
+	if contents != nil {
+		c = contents
+	}
 	rc := c.Client()
-	head := func(ctx context.Context) (uint64, error) { return c.BlockNumber(ctx) }
+	head := func(ctx context.Context) (uint64, error) { return sendClient.BlockNumber(ctx) }
 	hashes := func(ctx context.Context, height uint64) ([]common.Hash, error) {
 		var blk struct {
 			Transactions []common.Hash `json:"transactions"`
@@ -581,7 +793,10 @@ func (d *Driver) RunConfigured(ctx context.Context, duration time.Duration, spec
 	if stdEnabled && len(stdAccs) == 0 {
 		log.Printf("[load] WARNING: no accounts left for standard kinds after VIP reservation (accountsN too small)")
 	}
-	stdHead, stdHashes := blockFeed(d.pool.Client)
+	depth := d.inflightDepth()
+	log.Printf("[load] per-account in-flight depth %d (in-flight cap: std %d, vip %d)",
+		depth, len(stdAccs)*depth, len(vipAccs)*depth)
+	stdHead, stdHashes := blockFeed(d.pool.Client, d.feedClient)
 	d.std = newLaneEngine("std", 0,
 		d.pool.Client.SendTransaction,
 		func(ctx context.Context, addr common.Address) (uint64, error) {
@@ -590,7 +805,7 @@ func (d *Driver) RunConfigured(ctx context.Context, duration time.Duration, spec
 			return accounts.CommittedNonceAt(ctx, d.pool.Client, addr)
 		},
 		stdHead, stdHashes,
-		stdAccs)
+		stdAccs, depth, d.maxInflight)
 	if vipEnabled {
 		vipKey := d.builder.NonceKey(KindVIP)
 		vipClient := d.vipClient
@@ -598,17 +813,89 @@ func (d *Driver) RunConfigured(ctx context.Context, duration time.Duration, spec
 		// nodes commit the same block seconds apart under load, and confirming
 		// through the faster one turns every follow-up nonce into a rejection
 		// on the slower one (see engine.go).
-		vipHead, vipHashes := blockFeed(vipClient)
+		// The VIP engine keeps both reads on its own endpoint: a separate
+		// contents node is only safe when it commits the same chain, and the
+		// enterprise node is the one whose lag motivated the rule.
+		vipHead, vipHashes := blockFeed(vipClient, nil)
 		d.vip = newLaneEngine("vip", vipKey,
 			vipClient.SendTransaction,
 			func(ctx context.Context, addr common.Address) (uint64, error) {
 				return accounts.Nonce2D(ctx, vipClient, addr, vipKey)
 			},
 			vipHead, vipHashes,
-			vipAccs)
+			vipAccs, depth, d.maxInflight)
 	}
 
 	var wg sync.WaitGroup
+
+	// Closed-loop controller. Only the std engine drives it: it owns the send
+	// endpoint the measurement describes. Fresh-supply control is preferred;
+	// raw depth is the fallback when no caught-up node is configured.
+	if d.targetMempoolDepth > 0 && (d.committedTxs != nil || d.mempoolDepth != nil) {
+		fresh := d.committedTxs != nil
+		d.std.depthTarget = int64(d.targetMempoolDepth)
+		d.std.depthBudget.Store(int64(d.targetMempoolDepth))
+		if fresh {
+			log.Printf("[load] fresh-supply controller: holding %d txs sent-but-not-yet-in-a-block (polled every %s)",
+				d.targetMempoolDepth, mempoolPoll)
+		} else {
+			log.Printf("[load] mempool-depth controller: holding the send endpoint at %d txs (polled every %s). "+
+				"NOTE: depth counts txs the validators already committed but this node has not pruned, which the "+
+				"provider cannot serve - configure a validator cometRPC to control on fresh supply instead",
+				d.targetMempoolDepth, mempoolPoll)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			t := time.NewTicker(mempoolPoll)
+			defer t.Stop()
+			fails := 0
+			var sent0 int
+			var committed0 uint64
+			primed := false
+			for {
+				select {
+				case <-runCtx.Done():
+					return
+				case <-t.C:
+				}
+				var n int
+				var err error
+				if fresh {
+					// Read the send count FIRST: counting committed txs after it
+					// can only make fresh look smaller, never larger, so the
+					// controller errs toward under-supplying rather than
+					// flooding the mempool.
+					s := d.sink.Total()
+					var c uint64
+					if c, err = d.committedTxs(runCtx); err == nil {
+						if !primed {
+							sent0, committed0, primed = s, c, true
+							continue
+						}
+						n = (s - sent0) - int(c-committed0)
+						if n < 0 {
+							n = 0 // committed can briefly overtake on a fast block
+						}
+					}
+				} else {
+					n, err = d.mempoolDepth(runCtx)
+				}
+				if err != nil {
+					// Losing the signal must not silently turn into an
+					// unthrottled sender: leave the last budget in place and say
+					// so, so a broken probe is visible rather than mistaken for
+					// a chain that suddenly got faster.
+					if fails++; fails%50 == 1 {
+						log.Printf("[load] supply probe failing (%v); holding the last budget", err)
+					}
+					continue
+				}
+				fails = 0
+				d.std.observeMempoolDepth(n)
+			}
+		}()
+	}
 
 	// Fee refresher.
 	wg.Add(1)
@@ -666,11 +953,24 @@ func (d *Driver) RunConfigured(ctx context.Context, duration time.Duration, spec
 			case <-runCtx.Done():
 				return
 			case <-t.C:
-				line := fmt.Sprintf("[load] progress: accepted=%d std{pending=%d ready=%d starved=%d races=%d}",
-					d.sink.Total(), d.std.npend.Load(), len(d.std.ready), d.std.starved.Load(), d.std.busyRace.Load())
+				// inflight/limit is the number to watch. The limit is adaptive:
+				// it settles at the endpoint's real mempool capacity, so a limit
+				// far below accountsN*depth means the chain, not the pool, is
+				// what bounds the offered load.
+				line := fmt.Sprintf("[load] progress: accepted=%d std{inflight=%d/%d ready=%d starved=%d races=%d}",
+					d.sink.Total(), d.std.npend.Load(), d.std.inflightLimit.Load(),
+					len(d.std.ready), d.std.starved.Load(), d.std.busyRace.Load())
+				if d.std.depthTarget > 0 {
+					// mempool= is the controlled variable. Holding near the
+					// setpoint means the proposer always finds candidates;
+					// repeatedly reading 0 means the driver cannot refill fast
+					// enough and blocks are going out empty.
+					line += fmt.Sprintf(" mempool=%d/%d", d.std.depthObserved.Load(), d.std.depthTarget)
+				}
 				if d.vip != nil {
-					line += fmt.Sprintf(" vip{pending=%d ready=%d starved=%d races=%d}",
-						d.vip.npend.Load(), len(d.vip.ready), d.vip.starved.Load(), d.vip.busyRace.Load())
+					line += fmt.Sprintf(" vip{inflight=%d/%d ready=%d starved=%d races=%d}",
+						d.vip.npend.Load(), d.vip.inflightLimit.Load(),
+						len(d.vip.ready), d.vip.starved.Load(), d.vip.busyRace.Load())
 				}
 				log.Printf("%s outcomes{%s}", line, d.sink.outcomeSummary())
 			}
@@ -728,8 +1028,23 @@ func (d *Driver) RunConfigured(ctx context.Context, duration time.Duration, spec
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			// owed is this worker's credit debt from its last burst. sendOne
+			// takes ONE credit up front and may send several txs; the extras are
+			// paid for here, before the next burst starts, so every tx costs
+			// exactly one credit and the long-run rate is still targetTPS. Paying
+			// afterwards rather than during is what lets a burst stay contiguous:
+			// blocking for credits mid-run would spread an account's nonces
+			// across Commits, which is precisely what the burst exists to avoid.
+			owed := 0
 			for runCtx.Err() == nil {
 				if tokens != nil {
+					for ; owed > 0; owed-- {
+						select {
+						case <-runCtx.Done():
+							return
+						case <-tokens:
+						}
+					}
 					select {
 					case <-runCtx.Done():
 						return
@@ -750,10 +1065,12 @@ func (d *Driver) RunConfigured(ctx context.Context, duration time.Duration, spec
 				if engine.backoffWait(runCtx) {
 					continue // that endpoint said "mempool full"; skip this slot
 				}
-				sent := false
+				sent := 0
 				switch kind {
 				case KindUnordered:
-					sent = d.unorderedAttempt(runCtx)
+					if d.unorderedAttempt(runCtx) {
+						sent = 1
+					}
 				case KindVIP:
 					if d.vip != nil {
 						sent = d.vip.sendOne(runCtx, d, KindVIP)
@@ -761,7 +1078,10 @@ func (d *Driver) RunConfigured(ctx context.Context, duration time.Duration, spec
 				default:
 					sent = d.std.sendOne(runCtx, d, kind)
 				}
-				if tokens == nil && !sent {
+				if sent > 1 {
+					owed = sent - 1
+				}
+				if tokens == nil && sent == 0 {
 					// Uncapped mode: everything in flight - don't hot-spin.
 					if sleep(runCtx, 2*time.Millisecond) {
 						return

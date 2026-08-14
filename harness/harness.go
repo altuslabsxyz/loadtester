@@ -288,6 +288,45 @@ func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string,
 		driver.SetTipRamp(r)
 		log.Printf("[load] tip ramp: +%d wei/s so fresh txs outrank stale ones in the provider's reap window", r)
 	}
+	driver.SetPerAccountInflight(tgt.Workload.PerAccountInflight)
+	driver.SetMaxInflight(tgt.Workload.MaxInflight)
+	if depth := tgt.Workload.TargetMempoolDepth; depth > 0 {
+		// Prefer fresh-supply control off a CAUGHT-UP node. Reading the
+		// committed count from the send endpoint would carry the same lag the
+		// controller exists to cancel, so only a different node will do.
+		switch fresh := tgt.FreshSupplyCometRPC(); {
+		case fresh != "":
+			ctr := collector.NewCommittedTxCounter(fresh)
+			driver.SetFreshSupplyController(depth, ctr.Total)
+			log.Printf("[load] committed-tx feed: %s", fresh)
+		case tgt.PrimaryCometRPC() != "":
+			crpc := tgt.PrimaryCometRPC()
+			driver.SetMempoolDepthController(depth, func(c context.Context) (int, error) {
+				return collector.NumUnconfirmedTxs(c, crpc)
+			})
+		default:
+			log.Printf("[load] workload.targetMempoolDepth is set but no cometRPC is reachable; " +
+				"the supply controller is DISABLED and maxInflight governs instead")
+		}
+	}
+	// Move the confirm feed's block-contents reads off the send endpoint when
+	// the target names another node. A failure here is not fatal: the feed
+	// falls back to the send endpoint, which is correct, just costlier.
+	if frpc := tgt.BlockFeedJSONRPC(); frpc != "" {
+		c, _, ferr := accounts.Connect(ctx, frpc, tgt.ChainID)
+		switch {
+		case ferr != nil:
+			log.Printf("[load] block-feed endpoint %s unusable (%v); reading block contents from the send endpoint", frpc, ferr)
+		default:
+			if verr := workload.ValidateBlockFeed(ctx, pool.Client, c); verr != nil {
+				log.Printf("[load] NOT using %s for block contents: %v", frpc, verr)
+				log.Printf("[load] reading block contents from the send endpoint instead (correct, just costlier)")
+			} else {
+				driver.SetBlockFeedClient(c)
+				log.Printf("[load] block-contents feed: %s (validated; release still gated on the send endpoint's head)", frpc)
+			}
+		}
+	}
 
 	// Affordability preflight. The tip ramp is unbounded, so a run can be priced
 	// out mid-flight: the chain then refuses txs per account ("insufficient

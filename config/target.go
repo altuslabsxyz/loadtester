@@ -137,6 +137,54 @@ type Workload struct {
 	// AllowDestructive gates SELFDESTRUCT / heavy determinism scenarios.
 	// Defaults false (testnet-safe); must be explicitly enabled.
 	AllowDestructive bool `yaml:"allowDestructive"`
+	// PerAccountInflight caps how many ordered txs ONE account may have in the
+	// mempool at once, per nonce-key. 0 uses workload.DefaultPerAccountInflight
+	// (1).
+	//
+	// Raising it lifts the in-flight ceiling off accountsN - at depth 1 an
+	// account is out of rotation until its tx is confirmed, so the pool size IS
+	// the in-flight cap. But measured on stable_988-1 it LOWERED throughput
+	// (4,019 -> 2,486 tx/s from depth 1 to 2), because a fixed in-flight budget
+	// at depth D involves only accountsN/D distinct senders and one sender's txs
+	// are nonce-ordered, so they cannot execute in parallel. Prefer raising
+	// accountsN. See workload.DefaultPerAccountInflight for the full numbers.
+	//
+	// The product accountsN*perAccountInflight is the worst-case backlog and
+	// must stay under the node's mempool size (config.toml mempool.size).
+	PerAccountInflight int `yaml:"perAccountInflight"`
+	// MaxInflight caps the TOTAL txs the driver keeps in the endpoint's mempool.
+	// 0 means accountsN*perAccountInflight (i.e. no extra cap).
+	//
+	// This is the knob for producing a STEADY block size instead of a volatile
+	// one. Left uncapped, the driver simply fills the node's mempool - on
+	// stable_988-1 that is 30,000 txs - and the proposer then takes as much of
+	// it as it can in one block. Those oversized blocks take longer to execute
+	// than a block interval, the tx-provider full node drifts past its
+	// max_height_lag, it refuses to serve while it catches up, and the chain
+	// produces a run of empty blocks before dumping the whole mempool again.
+	// Measured on this devnet: block sizes alternating between 1 and 30,000.
+	//
+	// Setting this to roughly (target tx/s x block time x 1.5) keeps the backlog
+	// at about one and a half blocks - deep enough that a proposer never finds
+	// the mempool short, shallow enough that no block is oversized. For 10,000
+	// tx/s at 1.0s blocks, 15000.
+	MaxInflight int `yaml:"maxInflight"`
+	// TargetMempoolDepth makes the driver hold the send endpoint's mempool at
+	// this many transactions, measured every 100ms via CometBFT
+	// num_unconfirmed_txs. 0 disables the controller and falls back to
+	// MaxInflight. Requires a reachable cometRPC on the send node.
+	//
+	// This is the setting that decides block size, and it is the one to tune for
+	// "N transactions in every block". The proposer takes what the provider has,
+	// so a mempool held at N yields blocks of about N. Prefer it over
+	// MaxInflight: MaxInflight counts txs the driver has not yet CONFIRMED,
+	// which on this chain includes txs the validators already mined, so it
+	// throttles the driver for seconds after every block and leaves the mempool
+	// empty exactly when the next proposer needs it.
+	//
+	// Keep it under the EIP-1559 gas target (25,000 txs at max_gas 1.05B) so
+	// blocks never cross 50% and push the base fee up.
+	TargetMempoolDepth int `yaml:"targetMempoolDepth"`
 }
 
 // Observe configures the collectors.
@@ -285,6 +333,15 @@ func (t *Target) validate() error {
 	if t.Workload.TipRampWeiPerSec < 0 {
 		return fmt.Errorf("workload.tipRampWeiPerSec must be >= 0")
 	}
+	if t.Workload.PerAccountInflight < 0 || t.Workload.PerAccountInflight > 64 {
+		return fmt.Errorf("workload.perAccountInflight must be between 0 (default) and 64")
+	}
+	if t.Workload.MaxInflight < 0 {
+		return fmt.Errorf("workload.maxInflight must be >= 0 (0 = accountsN*perAccountInflight)")
+	}
+	if t.Workload.TargetMempoolDepth < 0 {
+		return fmt.Errorf("workload.targetMempoolDepth must be >= 0 (0 = disabled)")
+	}
 	laneNames := make([]string, 0, len(t.Workload.Lanes))
 	for name := range t.Workload.Lanes {
 		laneNames = append(laneNames, name)
@@ -360,6 +417,75 @@ func (t *Target) VIPJSONRPC() string {
 	for _, n := range t.Nodes {
 		if (n.Role == RoleGuaranteed || n.Role == RoleEnterprise || n.Role == RoleVIP) && strings.TrimSpace(n.JSONRPC) != "" {
 			return n.JSONRPC
+		}
+	}
+	return ""
+}
+
+// BlockFeedJSONRPC returns a JSON-RPC endpoint to read COMMITTED BLOCK CONTENTS
+// from, which is deliberately allowed to differ from the send endpoint.
+//
+// The send engine needs two different facts per block, with very different
+// costs. "Which of my txs are in block H" is consensus-agreed, so any node that
+// has committed H gives the identical answer. "Has the node I send to committed
+// past H" must come from the send endpoint itself, and is one cheap
+// eth_blockNumber.
+//
+// Reading contents from the send endpoint is expensive on exactly the wrong
+// machine. On stable_988-1 the send endpoint is the tx-provider full node, and
+// eth_getBlockByNumber there does CometBlockByNumber + BlockResults + convert
+// (stable-evm rpc/backend/blocks.go GetBlockByNumber) - for a 40,000-tx block
+// that is every tx result and its events, once per block, on the one node whose
+// falling behind already costs the chain whole empty blocks.
+//
+// So prefer any OTHER configured node for contents. Returns "" when the target
+// has only the send endpoint, in which case the engine reads both from it.
+func (t *Target) BlockFeedJSONRPC() string {
+	primary := t.PrimaryJSONRPC()
+	// Prefer a validator: it neither serves the tx provider nor runs the EVM
+	// indexer, so the extra reads land on the least loaded node.
+	for _, n := range t.Nodes {
+		if n.Role == RoleValidator && strings.TrimSpace(n.JSONRPC) != "" && n.JSONRPC != primary {
+			return n.JSONRPC
+		}
+	}
+	for _, n := range t.Nodes {
+		if strings.TrimSpace(n.JSONRPC) != "" && n.JSONRPC != primary {
+			return n.JSONRPC
+		}
+	}
+	return ""
+}
+
+// PrimaryCometRPC returns the CometBFT RPC of the node load is SENT to, which
+// is the only node whose mempool depth is meaningful for flow control.
+func (t *Target) PrimaryCometRPC() string {
+	primary := t.PrimaryJSONRPC()
+	for _, n := range t.Nodes {
+		if n.JSONRPC == primary && strings.TrimSpace(n.CometRPC) != "" {
+			return n.CometRPC
+		}
+	}
+	return ""
+}
+
+// FreshSupplyCometRPC returns a CometBFT RPC on a node OTHER than the send
+// endpoint, for counting committed transactions.
+//
+// It must not be the send endpoint. That node is the tx provider, it executes
+// blocks a beat behind the validators, and its committed count carries exactly
+// the lag the fresh-supply controller exists to cancel. A validator is caught up
+// by construction - it cannot commit a block it has not executed.
+func (t *Target) FreshSupplyCometRPC() string {
+	primary := t.PrimaryCometRPC()
+	for _, n := range t.Nodes {
+		if n.Role == RoleValidator && strings.TrimSpace(n.CometRPC) != "" && n.CometRPC != primary {
+			return n.CometRPC
+		}
+	}
+	for _, n := range t.Nodes {
+		if strings.TrimSpace(n.CometRPC) != "" && n.CometRPC != primary {
+			return n.CometRPC
 		}
 	}
 	return ""
