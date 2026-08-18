@@ -862,13 +862,20 @@ func (d *Driver) RunConfigured(ctx context.Context, duration time.Duration, spec
 				var n int
 				var err error
 				if fresh {
-					// Read the send count FIRST: counting committed txs after it
-					// can only make fresh look smaller, never larger, so the
-					// controller errs toward under-supplying rather than
-					// flooding the mempool.
-					s := d.sink.Total()
+					// Read COMMITTED first and sent second. fresh is
+					// sent-minus-committed, so a stale `sent` paired with a
+					// current `committed` makes fresh look SMALLER than it is,
+					// which inflates the budget and floods the endpoint. That
+					// ordering is not a detail: committedTxs walks /blockchain a
+					// page at a time and can take hundreds of milliseconds, which
+					// at 10k tx/s is thousands of transactions. Getting it the
+					// wrong way round produced a mempool swinging between 0 and
+					// 45,340 against an 11,000 setpoint, and 56% empty blocks.
+					// Taking committed first makes any skew overstate fresh, so
+					// the controller under-supplies by at most one poll instead.
 					var c uint64
 					if c, err = d.committedTxs(runCtx); err == nil {
+						s := d.sink.Total()
 						if !primed {
 							sent0, committed0, primed = s, c, true
 							continue
@@ -892,7 +899,20 @@ func (d *Driver) RunConfigured(ctx context.Context, duration time.Duration, spec
 					continue
 				}
 				fails = 0
-				d.std.observeMempoolDepth(n)
+				// Pair the fresh count with the endpoint's ACTUAL depth when we
+				// can read it. Depth is a physical upper bound on fresh (the
+				// mempool holds fresh txs plus committed ones not yet pruned),
+				// so it cannot mask a real backlog - but it does veto a fresh
+				// counter that has drifted high while the mempool actually
+				// drained. An empty mempool costs a block outright, so it gets
+				// the benefit of the doubt.
+				depth, haveDepth := 0, false
+				if fresh && d.mempoolDepth != nil {
+					if dv, derr := d.mempoolDepth(runCtx); derr == nil {
+						depth, haveDepth = dv, true
+					}
+				}
+				d.std.observeSupply(n, depth, haveDepth)
 			}
 		}()
 	}

@@ -294,16 +294,22 @@ func Run(ctx context.Context, targetPath, deploymentPath, outDir, failOn string,
 		// Prefer fresh-supply control off a CAUGHT-UP node. Reading the
 		// committed count from the send endpoint would carry the same lag the
 		// controller exists to cancel, so only a different node will do.
+		// The send endpoint's own depth is wired whenever it is reachable. On
+		// its own it is the fallback control signal; alongside the committed-tx
+		// feed it is the FLOOR that stops an empty mempool, which is the one
+		// failure that costs a block outright.
+		if crpc := tgt.PrimaryCometRPC(); crpc != "" {
+			driver.SetMempoolDepthController(depth, func(c context.Context) (int, error) {
+				return collector.NumUnconfirmedTxs(c, crpc)
+			})
+		}
 		switch fresh := tgt.FreshSupplyCometRPC(); {
 		case fresh != "":
 			ctr := collector.NewCommittedTxCounter(fresh)
 			driver.SetFreshSupplyController(depth, ctr.Total)
 			log.Printf("[load] committed-tx feed: %s", fresh)
 		case tgt.PrimaryCometRPC() != "":
-			crpc := tgt.PrimaryCometRPC()
-			driver.SetMempoolDepthController(depth, func(c context.Context) (int, error) {
-				return collector.NumUnconfirmedTxs(c, crpc)
-			})
+			// depth-only mode; already wired above
 		default:
 			log.Printf("[load] workload.targetMempoolDepth is set but no cometRPC is reachable; " +
 				"the supply controller is DISABLED and maxInflight governs instead")

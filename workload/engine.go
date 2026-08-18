@@ -105,6 +105,22 @@ const (
 	// head reads stay negligible (a hashes fetch happens only on a new height).
 	defaultConfirmPoll   = 200 * time.Millisecond // block-hash feed poll cadence
 	confirmCatchupMax    = 256                    // max blocks consumed per feed tick
+	// confirmFetchers is how many block-hash fetches the feed runs at once.
+	//
+	// One at a time is not enough here. eth_getBlockByNumber is not a cheap read
+	// on this chain: stable-evm's backend fetches the CometBFT block AND the full
+	// BlockResults - every tx result with its events - before converting, so the
+	// call scales with block size. At ~10,000 txs per block it can take longer
+	// than the block interval, and a strictly sequential feed then falls further
+	// behind with every block.
+	//
+	// That is not a reporting delay, it is a throughput bug: at depth 1 an
+	// account cannot send again until its tx is confirmed, so a lagging feed
+	// starves the driver of senders. Measured with the sequential feed: 69,939
+	// txs unconfirmed against a mempool of only ~5,000, ready accounts down to
+	// 4,969 of 75,000, and the mempool draining to zero - which costs an empty
+	// block every time it happens.
+	confirmFetchers = 8
 	defaultJanitorEvery  = 3 * time.Second        // pending-map sweep cadence
 	defaultProbeAfter    = 8 * time.Second        // probe pending entries older than this
 	defaultPendingTTL    = 90 * time.Second       // deliberate replacement after this
@@ -486,7 +502,26 @@ func (e *laneEngine) admit() bool {
 
 // observeMempoolDepth records a fresh measurement of the send endpoint's
 // mempool and re-derives the send budget from it.
-func (e *laneEngine) observeMempoolDepth(n int) {
+func (e *laneEngine) observeMempoolDepth(n int) { e.observeSupply(n, 0, false) }
+
+// observeSupply re-derives the send budget from a fresh-supply measurement,
+// cross-checked against the endpoint's ACTUAL mempool depth when available.
+//
+// It takes the SMALLER of the two. Depth is a physical upper bound on fresh -
+// the mempool holds the fresh transactions plus committed ones the node has
+// not pruned yet - so the minimum can never hide a real backlog from the
+// controller. What it does do is let a mempool that has genuinely drained
+// overrule a fresh counter that has drifted high.
+//
+// The asymmetry is deliberate. Over-supplying costs a deeper mempool, which
+// the next poll corrects; under-supplying costs an EMPTY BLOCK, which is gone
+// for good. When the two signals disagree, believe the one that keeps
+// transactions in front of the proposer.
+func (e *laneEngine) observeSupply(fresh, depth int, haveDepth bool) {
+	n := fresh
+	if haveDepth && depth < n {
+		n = depth
+	}
 	e.depthObserved.Store(int64(n))
 	if e.depthTarget > 0 {
 		e.depthBudget.Store(e.depthTarget - int64(n))
@@ -1008,19 +1043,53 @@ func (e *laneEngine) confirmLoop(ctx context.Context, d *Driver, poll time.Durat
 				last = h - 1 // process the block at startup first
 			}
 		}
-		for n := 0; last < h && n < confirmCatchupMax; n++ {
-			txs, herr := e.hashes(ctx, last+1)
-			if herr != nil {
-				break // transient: retry the same height next tick
+		for done := 0; last < h && done < confirmCatchupMax; {
+			lo := last + 1
+			hi := lo + confirmFetchers - 1
+			if hi > h {
+				hi = h
 			}
-			last++
-			for _, hash := range txs {
-				if v, ok := e.hashIdx.LoadAndDelete(hash); ok {
-					p := v.(*pendingTx)
-					if p.engine.resolve(d, p) {
-						d.sink.Note(OutcomeConfirmed)
+			if n := int(hi-lo) + 1; done+n > confirmCatchupMax {
+				hi = lo + uint64(confirmCatchupMax-done) - 1
+			}
+			type fetched struct {
+				txs []common.Hash
+				err error
+			}
+			out := make([]fetched, hi-lo+1)
+			var wg sync.WaitGroup
+			for i := range out {
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					txs, err := e.hashes(ctx, lo+uint64(i))
+					out[i] = fetched{txs, err}
+				}(i)
+			}
+			wg.Wait()
+			// Apply in height order and advance `last` only across a CONTIGUOUS
+			// run of successes, so a height that failed is retried next tick
+			// rather than silently skipped - a skipped height would strand every
+			// account whose tx was in it until the janitor's probe found it.
+			progressed := false
+			for i := range out {
+				if out[i].err != nil {
+					break
+				}
+				for _, hash := range out[i].txs {
+					if v, ok := e.hashIdx.LoadAndDelete(hash); ok {
+						p := v.(*pendingTx)
+						if p.engine.resolve(d, p) {
+							d.sink.Note(OutcomeConfirmed)
+						}
 					}
 				}
+				last = lo + uint64(i)
+				done++
+				progressed = true
+			}
+			if !progressed || ctx.Err() != nil {
+				break
 			}
 		}
 	}

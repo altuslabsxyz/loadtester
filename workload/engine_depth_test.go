@@ -505,3 +505,112 @@ func TestNonceRewindOnlyWithNothingInFlight(t *testing.T) {
 		}
 	})
 }
+
+// TestSupplyFloorPreventsEmptyMempool covers the failure that produced 56%
+// empty blocks: the fresh-supply counter drifted high while the endpoint's
+// mempool had actually drained, so the controller believed it was at setpoint
+// and stopped sending into an empty chain.
+//
+// Depth is a physical upper bound on fresh (the mempool holds fresh txs plus
+// committed ones not yet pruned), so when the two disagree the smaller one is
+// the honest reading of what a proposer can still be given.
+func TestSupplyFloorPreventsEmptyMempool(t *testing.T) {
+	const target = 500
+	accs := testAccounts(t, 4000)
+	var sent atomic.Int64
+	e := okEngine(t, accs, 1, &sent)
+	e.depthTarget = target
+	d, _ := testDriver(t)
+
+	drive := func() int64 {
+		before := sent.Load()
+		for i := 0; i < target*2; i++ {
+			e.sendOne(context.Background(), d, KindValue)
+		}
+		return sent.Load() - before
+	}
+
+	// Fresh says "at setpoint" but the mempool is empty. Without the floor the
+	// driver sends nothing and every block that follows is empty.
+	e.observeSupply(target, 0, true)
+	if n := drive(); n != target {
+		t.Fatalf("sent %d with fresh=%d but an EMPTY mempool, want a full refill of %d", n, target, target)
+	}
+
+	// Depth must not invent headroom that fresh says is not there: with depth
+	// ABOVE fresh, fresh still governs (it is the tighter, truer number).
+	e.observeSupply(target, target*4, true)
+	if n := drive(); n != 0 {
+		t.Fatalf("sent %d while fresh was at setpoint, want 0 - a high depth must not unblock sending", n)
+	}
+
+	// Partial drain tops up by the shortfall the DEPTH reading implies.
+	e.observeSupply(target, target-90, true)
+	if n := drive(); n != 90 {
+		t.Fatalf("sent %d, want exactly the 90-tx shortfall the drained mempool implies", n)
+	}
+
+	// With no depth signal the controller falls back to fresh alone.
+	e.observeSupply(target-40, 0, false)
+	if n := drive(); n != 40 {
+		t.Fatalf("sent %d in fresh-only mode, want 40", n)
+	}
+}
+
+// TestConfirmFeedCatchesUpOnSlowFetches covers the sender-starvation bug: the
+// feed fetched heights one at a time, and eth_getBlockByNumber on this chain
+// costs more than a block interval at 10k txs, so the feed fell permanently
+// behind and accounts never came back to the ready queue.
+func TestConfirmFeedCatchesUpOnSlowFetches(t *testing.T) {
+	accs := testAccounts(t, 64)
+	var sent atomic.Int64
+	e := okEngine(t, accs, 1, &sent)
+	d, _ := testDriver(t)
+	for range accs {
+		e.sendOne(context.Background(), d, KindValue)
+	}
+	if e.npend.Load() != 64 {
+		t.Fatalf("setup: npend %d, want 64", e.npend.Load())
+	}
+
+	// Spread the 64 in-flight hashes one per height across 64 heights, and make
+	// every fetch slow. Sequentially that is 64 x 20ms = 1.28s; concurrently it
+	// is ~8 rounds. The tick below only allows ~350ms.
+	var perHeight [][]common.Hash
+	e.pending.Range(func(_, v any) bool {
+		h, _, _, _, _ := v.(*pendingTx).snapshot()
+		perHeight = append(perHeight, []common.Hash{h})
+		return true
+	})
+	// The feed deliberately primes at the CURRENT head and ignores history, so
+	// report height 1 first (priming `last` to 0) and only then reveal the real
+	// head. That is what puts 64 heights of genuine catch-up in front of it.
+	var fetches atomic.Int64
+	var headCalls atomic.Int64
+	e.head = func(context.Context) (uint64, error) {
+		if headCalls.Add(1) == 1 {
+			return 1, nil
+		}
+		return uint64(len(perHeight)), nil
+	}
+	e.hashes = func(_ context.Context, height uint64) ([]common.Hash, error) {
+		fetches.Add(1)
+		time.Sleep(20 * time.Millisecond)
+		if height == 0 || int(height) > len(perHeight) {
+			return nil, nil
+		}
+		return perHeight[height-1], nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
+	e.confirmLoop(ctx, d, 5*time.Millisecond)
+	cancel()
+
+	if got := e.npend.Load(); got != 0 {
+		t.Fatalf("npend %d after the feed ran, want 0 - the feed could not keep up "+
+			"(%d fetches); at depth 1 that strands accounts and drains the mempool", got, fetches.Load())
+	}
+	if got := len(e.ready); got != 64 {
+		t.Fatalf("ready %d, want all 64 accounts recycled", got)
+	}
+}
